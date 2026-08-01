@@ -14,12 +14,16 @@
 //! at an optional observation point. See `ARCHITECTURE.md` for the design
 //! decisions this implementation follows — code refers to them as §n.
 //!
-//! This module tree currently holds the Phase 0 test foundation: the injection
-//! points that make time, ordering and storage faults controllable in tests.
+//! Implemented so far: the Phase 0 test foundation ([`clock`], [`seq`],
+//! [`storage`]) and the start of the Phase 1 data model — table schemas with
+//! their evolution rules ([`schema`]) and the system-column stamper
+//! ([`stamp`]).
 
 #![warn(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod clock;
+pub mod schema;
 pub mod seq;
+pub mod stamp;
 pub mod storage;

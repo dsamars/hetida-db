@@ -13,6 +13,11 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
+# Arrow is pinned to the version DataFusion resolves to, not to the latest
+# release: arrow, parquet, arrow-flight and datafusion must share one Arrow
+# major or their types conflict across crate boundaries. datafusion 54.1
+# resolves arrow 58.4, so Phase 3 must add datafusion 54.x, not a newer line.
+arrow = "58.4"
 thiserror = "2"
 
 [dev-dependencies]

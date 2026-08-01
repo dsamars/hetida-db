@@ -20,8 +20,19 @@ pub type Seq = u64;
 /// including across threads — two versions sharing a `seq` would be
 /// indistinguishable to version resolution.
 pub trait SequenceSource: fmt::Debug + Send + Sync {
+    /// Reserves `count` consecutive sequence numbers and returns the first.
+    ///
+    /// Reserving a block is the primitive rather than a convenience: a batch
+    /// needs one number per row, and taking them one at a time would let
+    /// another writer interleave, scattering a batch's versions across the
+    /// order. Reserving zero returns the number the next call would issue,
+    /// without consuming it.
+    fn reserve(&self, count: u64) -> Seq;
+
     /// Returns the next sequence number.
-    fn next(&self) -> Seq;
+    fn next(&self) -> Seq {
+        self.reserve(1)
+    }
 }
 
 /// Lock-free [`SequenceSource`] backed by an atomic counter.
@@ -43,8 +54,8 @@ impl AtomicSequence {
 }
 
 impl SequenceSource for AtomicSequence {
-    fn next(&self) -> Seq {
-        self.next.fetch_add(1, Ordering::Relaxed)
+    fn reserve(&self, count: u64) -> Seq {
+        self.next.fetch_add(count, Ordering::Relaxed)
     }
 }
 
