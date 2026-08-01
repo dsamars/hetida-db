@@ -30,3 +30,4 @@ pub mod schema;
 pub mod seq;
 pub mod stamp;
 pub mod storage;
+pub mod wal;

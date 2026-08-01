@@ -115,12 +115,20 @@ pub struct InMemoryStorage {
 struct MemoryState {
     objects: BTreeMap<PathBuf, Vec<u8>>,
     faults: VecDeque<Fault>,
+    syncs: usize,
 }
 
 impl InMemoryStorage {
     /// Creates an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How many times any handle onto this store has been synced.
+    ///
+    /// Lets a test observe fsync grouping (§4), which is otherwise invisible.
+    pub fn syncs(&self) -> usize {
+        self.lock().syncs
     }
 
     /// Queues a fault for the next append or sync.
@@ -214,13 +222,14 @@ impl AppendFile for MemoryAppendFile {
 
     fn sync(&mut self) -> StorageResult<()> {
         let mut state = self.lock();
-        match state.faults.pop_front() {
-            Some(Fault::Fail(kind)) => Err(StorageError::Io {
+        if let Some(Fault::Fail(kind)) = state.faults.pop_front() {
+            return Err(StorageError::Io {
                 path: self.path.clone(),
                 source: io::Error::from(kind),
-            }),
-            Some(Fault::TornWrite { .. }) | None => Ok(()),
+            });
         }
+        state.syncs += 1;
+        Ok(())
     }
 }
 

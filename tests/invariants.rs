@@ -17,10 +17,44 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use std::path::PathBuf;
+use std::time::Duration;
+
 use hetida_db::clock::{Clock, Micros, TestClock};
 use hetida_db::seq::{AtomicSequence, Seq, SequenceSource};
 use hetida_db::storage::{Fault, InMemoryStorage, Storage};
+use hetida_db::wal::{RecordKind, WalConfig, WalRecord, WalWriter, replay};
 use proptest::prelude::*;
+
+/// Generates a record with an arbitrary kind, sequence number and payload.
+fn any_record() -> impl Strategy<Value = WalRecord> {
+    (
+        prop_oneof![
+            Just(RecordKind::Data),
+            Just(RecordKind::Registration),
+            Just(RecordKind::Checkpoint),
+        ],
+        any::<Seq>(),
+        prop::collection::vec(any::<u8>(), 0..48),
+    )
+        .prop_map(|(kind, seq, payload)| WalRecord { kind, seq, payload })
+}
+
+/// Writes `records` to a fresh log and returns the store holding it.
+fn logged(records: &[WalRecord]) -> InMemoryStorage {
+    let storage = InMemoryStorage::new();
+    let mut writer = WalWriter::open(
+        Arc::new(storage.clone()),
+        PathBuf::from("wal"),
+        WalConfig {
+            segment_bytes: u64::MAX,
+            max_commit_delay: Duration::ZERO,
+        },
+    )
+    .expect("open");
+    writer.write_all(records).expect("write");
+    storage
+}
 
 /// Every injection point must survive being stored as a trait object, which is
 /// how the production components will hold them.
@@ -78,6 +112,49 @@ proptest! {
 
         let expected: Vec<u8> = chunks.concat();
         prop_assert_eq!(storage.read(path)?, expected);
+    }
+
+    /// §4: whatever was written comes back, byte for byte, for any record.
+    #[test]
+    fn wal_records_round_trip(records in prop::collection::vec(any_record(), 0..24)) {
+        let storage = logged(&records);
+        let recovered = replay(&storage, Path::new("wal"))?;
+
+        prop_assert_eq!(recovered.records, records);
+        prop_assert_eq!(recovered.truncated, None);
+    }
+
+    /// §4: this is the recovery guarantee itself. Cut the log at *any* byte and
+    /// replay returns a prefix of what was written — never a phantom record,
+    /// never a reordering, never a failure to start. Damage lands at the tail,
+    /// so everything before it stays trustworthy.
+    #[test]
+    fn a_log_cut_at_any_byte_replays_a_prefix(
+        records in prop::collection::vec(any_record(), 1..16),
+        cut in 0.0f64..1.0,
+    ) {
+        let storage = logged(&records);
+        let segment = storage.list(Path::new("wal"))?.pop().expect("one segment");
+        let bytes = storage.read(&segment)?;
+
+        let keep = (bytes.len() as f64 * cut) as usize;
+        storage.remove(&segment)?;
+        let mut handle = storage.open_append(&segment)?;
+        handle.append(bytes.get(..keep).unwrap_or_default())?;
+
+        let recovered = replay(&storage, Path::new("wal"))?.records;
+
+        prop_assert!(
+            recovered.len() <= records.len(),
+            "replay invented {} records out of {}",
+            recovered.len(),
+            records.len()
+        );
+        prop_assert_eq!(
+            &recovered[..],
+            &records[..recovered.len()],
+            "replay returned something other than a prefix"
+        );
     }
 
     /// §4: a torn write always leaves a prefix of the intended bytes, never a
