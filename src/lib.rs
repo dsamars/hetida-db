@@ -23,6 +23,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod clock;
+pub mod memtable;
+pub mod registry;
 pub mod schema;
 pub mod seq;
 pub mod stamp;

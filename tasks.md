@@ -18,10 +18,11 @@ Every task is executed test-first: its tests are written and failing before any 
 ## Phase 1: Data Model & Ingestion Engine
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
 - [ ] Build the multi-table catalogue mapping table name to its `TableSchema`, applying evolution on ingest and surfacing rejections as explicit Flight errors (§6).
-- [ ] Build the persistent metric registry mapping name + label set to a `u64` id, idempotent on re-registration, written through the WAL and exposed as a queryable catalog table (§10).
+- [x] Build the metric registry mapping name + label set to a `u64` id, idempotent on re-registration, durable before visible through a `RegistrationLog` seam (§10).
+- [ ] Wire the registry's `RegistrationLog` to the WAL and expose the registry as a queryable catalog table (§4, §10).
 - [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
 - [x] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
-- [ ] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
+- [x] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
 - [ ] Implement retransmission suppression: discard an incoming version whose payload is byte-identical to the current latest version of the same logical row (§1).
 - [ ] Implement partition routing: split each incoming `RecordBatch` by the configured interval at insert time, since one batch may span interval boundaries (§3, §11).
 - [ ] Implement freeze-and-swap so a flush never blocks ingestion: freeze the active `MemTable`, open a new one, hand the frozen one to the background writer (§2).

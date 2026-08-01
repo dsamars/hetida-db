@@ -18,6 +18,7 @@ readme = "README.md"
 # major or their types conflict across crate boundaries. datafusion 54.1
 # resolves arrow 58.4, so Phase 3 must add datafusion 54.x, not a newer line.
 arrow = "58.4"
+dashmap = "6.2.1"
 thiserror = "2"
 
 [dev-dependencies]
