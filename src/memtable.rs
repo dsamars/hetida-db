@@ -26,15 +26,22 @@
 //! no benefit, because the flush path does not read a live table: freeze-and-
 //! swap (§2) retires the table first, and only then is it read.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use arrow::array::{Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt64Array,
+};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
+use arrow::row::{RowConverter, SortField};
 use dashmap::DashMap;
 
 use crate::clock::Micros;
 use crate::registry::MetricId;
-use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN};
+use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN, is_reserved};
 use crate::seq::Seq;
 
 /// Identity of a logical row (§1).
@@ -73,24 +80,89 @@ pub enum MemTableError {
     /// A key column had an unexpected Arrow type.
     #[error("column `{0}` has an unexpected type")]
     WrongColumnType(String),
+    /// The payload could not be encoded or the batch could not be filtered.
+    #[error("could not process the batch: {0}")]
+    Arrow(#[from] ArrowError),
+}
+
+/// What an insert did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InsertOutcome {
+    /// Rows that became new versions.
+    pub inserted: usize,
+    /// Rows discarded as retransmissions (§1).
+    pub suppressed: usize,
+}
+
+/// One logical row: its versions, and what the newest of them holds.
+#[derive(Debug, Default)]
+struct LogicalRow {
+    /// Versions in `seq` order.
+    versions: Vec<VersionRef>,
+    /// Encoded payload of the highest-`seq` version, for §1 suppression.
+    latest_payload: Vec<u8>,
+}
+
+impl LogicalRow {
+    /// Highest `seq` held, if any.
+    fn max_seq(&self) -> Option<Seq> {
+        self.versions.last().map(|version| version.seq)
+    }
 }
 
 /// Buffers stamped batches, retaining every version.
 #[derive(Debug)]
 pub struct MemTable {
     schema: SchemaRef,
+    payload_columns: Vec<usize>,
+    encoder: RowConverter,
     batches: RwLock<Vec<RecordBatch>>,
-    index: DashMap<RowKey, Vec<VersionRef>>,
+    index: DashMap<RowKey, LogicalRow>,
+    writers: AtomicUsize,
 }
 
 impl MemTable {
     /// Creates an empty table accepting batches with this storage schema.
-    pub fn new(schema: SchemaRef) -> Self {
-        Self {
+    ///
+    /// Fails only if the payload columns cannot be row-encoded, which the
+    /// suppression comparison depends on.
+    pub fn new(schema: SchemaRef) -> Result<Self, MemTableError> {
+        let payload_columns: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !is_reserved(field.name()))
+            .map(|(index, _)| index)
+            .collect();
+
+        let sort_fields: Vec<SortField> = payload_columns
+            .iter()
+            .filter_map(|index| schema.fields().get(*index))
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect();
+
+        Ok(Self {
             schema,
+            payload_columns,
+            encoder: RowConverter::new(sort_fields)?,
             batches: RwLock::new(Vec::new()),
             index: DashMap::new(),
-        }
+            writers: AtomicUsize::new(0),
+        })
+    }
+
+    /// Counter of writers currently inside this table.
+    ///
+    /// Owned here rather than by the holder so that a table handed to the
+    /// flusher can be asked directly whether anyone is still writing to it.
+    /// See [`crate::active::ActiveMemTable::freeze`].
+    pub fn writers(&self) -> &AtomicUsize {
+        &self.writers
+    }
+
+    /// How many writers are currently inside this table.
+    pub fn writers_in_flight(&self) -> usize {
+        self.writers.load(Ordering::SeqCst)
     }
 
     /// The storage schema, system columns included.
@@ -102,7 +174,7 @@ impl MemTable {
     ///
     /// Refuses a batch whose schema is not this table's — an unstamped batch
     /// has no version identity, and the table must not invent one.
-    pub fn insert(&self, batch: &RecordBatch) -> Result<usize, MemTableError> {
+    pub fn insert(&self, batch: &RecordBatch) -> Result<InsertOutcome, MemTableError> {
         if batch.schema() != self.schema {
             return Err(MemTableError::SchemaMismatch {
                 expected: Arc::clone(&self.schema),
@@ -112,53 +184,148 @@ impl MemTable {
 
         let rows = batch.num_rows();
         if rows == 0 {
-            return Ok(0);
+            return Ok(InsertOutcome::default());
         }
 
-        let metric_ids = self.u64_column(batch, METRIC_ID_COLUMN)?;
-        let seqs = self.u64_column(batch, SEQ_COLUMN)?;
-        let timestamps = self.timestamp_column(batch, TIMESTAMP_COLUMN)?;
+        let keys = self.row_keys(batch)?;
+        let seqs = self.u64_column(batch, SEQ_COLUMN)?.values().to_vec();
+        let payloads = self.encode_payloads(batch)?;
 
-        // Publish the batch first so index entries can point at a stable slot.
+        let keep = self.decide(&keys, &seqs, &payloads);
+        let kept = keep.iter().filter(|keep| **keep).count();
+        let outcome = InsertOutcome {
+            inserted: kept,
+            suppressed: rows - kept,
+        };
+        if kept == 0 {
+            return Ok(outcome);
+        }
+
+        // Only a batch that actually lost rows is rebuilt; the common path
+        // stores the client's arrays untouched, as the hot-path rule requires.
+        let stored = if kept == rows {
+            batch.clone()
+        } else {
+            filter_record_batch(batch, &BooleanArray::from(keep.clone()))?
+        };
+
         let batch_index = {
             let mut batches = self.write_batches();
-            batches.push(batch.clone());
+            batches.push(stored);
             batches.len() - 1
         };
 
-        for (row, ((metric_id, timestamp), seq)) in metric_ids
+        let mut stored_row = 0;
+        for (row, key) in keys.iter().enumerate() {
+            if !keep.get(row).copied().unwrap_or(false) {
+                continue;
+            }
+            let seq = seqs.get(row).copied().unwrap_or_default();
+            let version = VersionRef {
+                key: *key,
+                seq,
+                batch: batch_index,
+                row: stored_row,
+            };
+            stored_row += 1;
+
+            let mut entry = self.index.entry(*key).or_default();
+            // Kept in `seq` order: arrival order is not version order, since a
+            // batch reserved earlier may be inserted later.
+            let at = entry.versions.partition_point(|held| held.seq < seq);
+            entry.versions.insert(at, version);
+            // The comparison target is the newest version, so an out-of-order
+            // arrival must not overwrite it.
+            if entry.max_seq() == Some(seq)
+                && let Some(payload) = payloads.get(row)
+            {
+                entry.latest_payload = payload.clone();
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// Decides which rows survive §1 retransmission suppression.
+    ///
+    /// A row is discarded when its payload is byte-identical to the newest
+    /// version currently held for the same logical row. Rows earlier in the
+    /// same batch count towards that, so a batch repeated inside itself
+    /// collapses too.
+    fn decide(&self, keys: &[RowKey], seqs: &[Seq], payloads: &[Vec<u8>]) -> Vec<bool> {
+        // Tracks what each key's newest kept version holds while walking the
+        // batch, so the index is not mutated before the outcome is known.
+        let mut pending: HashMap<RowKey, (Seq, &[u8])> = HashMap::new();
+
+        keys.iter()
+            .enumerate()
+            .map(|(row, key)| {
+                let seq = seqs.get(row).copied().unwrap_or_default();
+                let Some(payload) = payloads.get(row) else {
+                    return false;
+                };
+
+                // The comparison happens inside the map guard's scope so no
+                // borrow of the index escapes into the loop body.
+                let (latest_seq, is_retransmission) = match pending.get(key) {
+                    Some((held_seq, held_payload)) => {
+                        (Some(*held_seq), *held_payload == payload.as_slice())
+                    }
+                    None => match self.index.get(key) {
+                        Some(entry) => (
+                            entry.max_seq(),
+                            entry.latest_payload.as_slice() == payload.as_slice(),
+                        ),
+                        None => (None, false),
+                    },
+                };
+
+                if is_retransmission {
+                    return false;
+                }
+                if latest_seq.is_none_or(|held| seq > held) {
+                    pending.insert(*key, (seq, payload.as_slice()));
+                }
+                true
+            })
+            .collect()
+    }
+
+    /// Encodes each row's payload columns into comparable bytes.
+    ///
+    /// The system columns are excluded: they differ on every write by
+    /// construction, so including them would defeat suppression entirely.
+    fn encode_payloads(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, MemTableError> {
+        let columns: Vec<ArrayRef> = self
+            .payload_columns
+            .iter()
+            .filter_map(|index| batch.columns().get(*index).cloned())
+            .collect();
+        let rows = self.encoder.convert_columns(&columns)?;
+        Ok(rows.iter().map(|row| row.as_ref().to_vec()).collect())
+    }
+
+    /// Reads the identity columns into logical row keys.
+    fn row_keys(&self, batch: &RecordBatch) -> Result<Vec<RowKey>, MemTableError> {
+        let metric_ids = self.u64_column(batch, METRIC_ID_COLUMN)?;
+        let timestamps = self.timestamp_column(batch, TIMESTAMP_COLUMN)?;
+
+        Ok(metric_ids
             .values()
             .iter()
             .zip(timestamps.values().iter())
-            .zip(seqs.values().iter())
-            .enumerate()
-        {
-            let key = RowKey {
+            .map(|(metric_id, timestamp)| RowKey {
                 metric_id: *metric_id,
                 timestamp: *timestamp,
-            };
-            let version = VersionRef {
-                key,
-                seq: *seq,
-                batch: batch_index,
-                row,
-            };
-
-            let mut versions = self.index.entry(key).or_default();
-            // Kept in `seq` order: arrival order is not version order, since a
-            // batch reserved earlier may be inserted later.
-            let at = versions.partition_point(|existing| existing.seq < version.seq);
-            versions.insert(at, version);
-        }
-
-        Ok(rows)
+            })
+            .collect())
     }
 
     /// Every version of a logical row, in `seq` order.
     pub fn versions(&self, key: RowKey) -> Vec<VersionRef> {
         self.index
             .get(&key)
-            .map(|versions| versions.clone())
+            .map(|entry| entry.versions.clone())
             .unwrap_or_default()
     }
 
@@ -166,7 +333,7 @@ impl MemTable {
     pub fn latest(&self, key: RowKey) -> Option<VersionRef> {
         self.index
             .get(&key)
-            .and_then(|versions| versions.last().copied())
+            .and_then(|entry| entry.versions.last().copied())
     }
 
     /// All versions in `(metric_id, timestamp, seq)` order — the flush order
@@ -175,7 +342,7 @@ impl MemTable {
         let mut all: Vec<VersionRef> = self
             .index
             .iter()
-            .flat_map(|entry| entry.value().clone())
+            .flat_map(|entry| entry.value().versions.clone())
             .collect();
         all.sort_unstable_by_key(|version| {
             (version.key.metric_id, version.key.timestamp, version.seq)
@@ -269,6 +436,10 @@ mod tests {
     }
 
     /// Builds a stamped batch from `(metric_id, timestamp, seq)` triples.
+    ///
+    /// The payload is derived from `seq` so that every version differs. Tests
+    /// that need an identical payload — the retransmission case — use
+    /// [`stamped_with_values`] and say so explicitly.
     fn stamped(rows: &[(u64, i64, u64)]) -> RecordBatch {
         RecordBatch::try_new(
             storage_schema(),
@@ -279,7 +450,11 @@ mod tests {
                 Arc::new(UInt64Array::from(
                     rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
                 )),
-                Arc::new(Float64Array::from(vec![1.5f64; rows.len()])),
+                Arc::new(Float64Array::from(
+                    rows.iter()
+                        .map(|(_, _, seq)| *seq as f64)
+                        .collect::<Vec<_>>(),
+                )),
                 Arc::new(TimestampMicrosecondArray::from(vec![100i64; rows.len()])),
                 Arc::new(UInt64Array::from(
                     rows.iter().map(|(_, _, seq)| *seq).collect::<Vec<_>>(),
@@ -290,7 +465,7 @@ mod tests {
     }
 
     fn table() -> MemTable {
-        MemTable::new(storage_schema())
+        MemTable::new(storage_schema()).unwrap()
     }
 
     #[test]
@@ -305,7 +480,10 @@ mod tests {
     fn inserting_indexes_every_row() {
         let table = table();
         assert_eq!(
-            table.insert(&stamped(&[(1, 10, 0), (2, 20, 1)])).unwrap(),
+            table
+                .insert(&stamped(&[(1, 10, 0), (2, 20, 1)]))
+                .unwrap()
+                .inserted,
             2
         );
 
@@ -316,7 +494,10 @@ mod tests {
     #[test]
     fn an_empty_batch_changes_nothing() {
         let table = table();
-        assert_eq!(table.insert(&stamped(&[])).unwrap(), 0);
+        assert_eq!(
+            table.insert(&stamped(&[])).unwrap(),
+            InsertOutcome::default()
+        );
         assert_eq!(table.num_rows(), 0);
     }
 
@@ -512,6 +693,207 @@ mod tests {
         assert_eq!(table.num_rows(), total);
         assert_eq!(table.num_logical_rows(), total);
         assert_eq!(table.sorted().len(), total);
+    }
+
+    /// Builds a stamped batch with an explicit payload value per row.
+    fn stamped_with_values(rows: &[(u64, i64, u64, Option<f64>)]) -> RecordBatch {
+        RecordBatch::try_new(
+            storage_schema(),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|(_, ts, _, _)| *ts).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, _, _, v)| *v).collect::<Vec<_>>(),
+                )),
+                Arc::new(TimestampMicrosecondArray::from(vec![100i64; rows.len()])),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(_, _, seq, _)| *seq).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// §1: at-least-once delivery is the norm over Flight. A client re-sending
+    /// a batch after a timeout must not manufacture a phantom version that time
+    /// travel would then report as a change.
+    #[test]
+    fn an_identical_retransmission_is_suppressed() {
+        let table = table();
+        let batch = stamped_with_values(&[(1, 10, 0, Some(1.5))]);
+        table.insert(&batch).unwrap();
+
+        let outcome = table
+            .insert(&stamped_with_values(&[(1, 10, 1, Some(1.5))]))
+            .unwrap();
+
+        assert_eq!(outcome.inserted, 0);
+        assert_eq!(outcome.suppressed, 1);
+        assert_eq!(table.num_rows(), 1);
+        assert_eq!(
+            table
+                .versions(RowKey {
+                    metric_id: 1,
+                    timestamp: 10
+                })
+                .len(),
+            1
+        );
+    }
+
+    /// A genuine correction differs by definition, so it must survive.
+    #[test]
+    fn a_changed_payload_is_a_new_version() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 0, Some(1.5))]))
+            .unwrap();
+
+        let outcome = table
+            .insert(&stamped_with_values(&[(1, 10, 1, Some(2.5))]))
+            .unwrap();
+
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(outcome.suppressed, 0);
+        assert_eq!(table.num_rows(), 2);
+    }
+
+    /// §1 compares against the *current latest* version, not the whole history.
+    /// Reverting to an earlier value is a real correction, not a duplicate.
+    #[test]
+    fn returning_to_an_earlier_value_is_not_suppressed() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 0, Some(1.5))]))
+            .unwrap();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 1, Some(2.5))]))
+            .unwrap();
+
+        let outcome = table
+            .insert(&stamped_with_values(&[(1, 10, 2, Some(1.5))]))
+            .unwrap();
+
+        assert_eq!(outcome.inserted, 1, "a revert is a correction, not a retry");
+        assert_eq!(table.num_rows(), 3);
+    }
+
+    #[test]
+    fn an_identical_payload_on_another_logical_row_is_kept() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 0, Some(1.5))]))
+            .unwrap();
+
+        let outcome = table
+            .insert(&stamped_with_values(&[(2, 10, 1, Some(1.5))]))
+            .unwrap();
+
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(table.num_logical_rows(), 2);
+    }
+
+    #[test]
+    fn a_partially_retransmitted_batch_keeps_only_the_new_rows() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[
+                (1, 10, 0, Some(1.5)),
+                (2, 20, 1, Some(2.5)),
+            ]))
+            .unwrap();
+
+        let outcome = table
+            .insert(&stamped_with_values(&[
+                (1, 10, 2, Some(1.5)),  // retransmission
+                (2, 20, 3, Some(9.0)),  // correction
+                (3, 30, 4, Some(0.25)), // new row
+            ]))
+            .unwrap();
+
+        assert_eq!(outcome.inserted, 2);
+        assert_eq!(outcome.suppressed, 1);
+        assert_eq!(table.num_rows(), 4);
+        assert_eq!(
+            table
+                .versions(RowKey {
+                    metric_id: 1,
+                    timestamp: 10
+                })
+                .len(),
+            1
+        );
+        assert_eq!(
+            table
+                .versions(RowKey {
+                    metric_id: 2,
+                    timestamp: 20
+                })
+                .len(),
+            2
+        );
+    }
+
+    /// Suppression must be idempotent — that is the property Phase 4 verifies.
+    #[test]
+    fn repeating_a_batch_many_times_leaves_one_version() {
+        let table = table();
+        for seq in 0..10 {
+            table
+                .insert(&stamped_with_values(&[(1, 10, seq, Some(1.5))]))
+                .unwrap();
+        }
+
+        assert_eq!(table.num_rows(), 1);
+    }
+
+    /// Nulls take part in the comparison: null and a value are different
+    /// payloads, two nulls are the same one.
+    #[test]
+    fn nulls_compare_like_any_other_payload() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 0, None)]))
+            .unwrap();
+
+        let repeated = table
+            .insert(&stamped_with_values(&[(1, 10, 1, None)]))
+            .unwrap();
+        assert_eq!(repeated.suppressed, 1);
+
+        let changed = table
+            .insert(&stamped_with_values(&[(1, 10, 2, Some(1.5))]))
+            .unwrap();
+        assert_eq!(changed.inserted, 1);
+    }
+
+    /// The system columns differ on every write by construction, so they must
+    /// be excluded from the comparison or nothing would ever be suppressed.
+    #[test]
+    fn differing_system_columns_do_not_defeat_suppression() {
+        let table = table();
+        table
+            .insert(&stamped_with_values(&[(1, 10, 0, Some(1.5))]))
+            .unwrap();
+
+        // Same payload, different seq *and* a different system_time.
+        let later = RecordBatch::try_new(
+            storage_schema(),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![10i64])),
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(Float64Array::from(vec![1.5f64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![999_999i64])),
+                Arc::new(UInt64Array::from(vec![42u64])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(table.insert(&later).unwrap().suppressed, 1);
     }
 
     /// Versions of one logical row written concurrently must all survive.

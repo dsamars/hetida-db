@@ -13,6 +13,7 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
+arc-swap = "1.9.2"
 # Arrow is pinned to the version DataFusion resolves to, not to the latest
 # release: arrow, parquet, arrow-flight and datafusion must share one Arrow
 # major or their types conflict across crate boundaries. datafusion 54.1

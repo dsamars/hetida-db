@@ -22,6 +22,7 @@
 #![warn(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+pub mod active;
 pub mod clock;
 pub mod memtable;
 pub mod registry;

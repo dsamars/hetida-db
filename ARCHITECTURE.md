@@ -161,4 +161,5 @@ Retention has a **second, independent dimension** since §1:
 - **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
 - **Downsampling / rollup** before retention deletion (§8) — deferred.
 - **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.
+- **How far back retransmission suppression must reach** (§1) — it currently compares against the newest version the *active* memtable holds, so a retry arriving after that version was flushed is not recognised and becomes a phantom version. Closing the gap means either carrying a payload digest per logical row across freezes, or consulting flushed data on ingest. Undecided.
 - **Tiered partition intervals** (§11) — fine granularity for recent data, coarse for aged. Not needed for the stated weeks-to-months query pattern, which a flat configurable interval already serves; deferred unless measurement contradicts it.
