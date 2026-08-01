@@ -8,11 +8,12 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 Every task is executed test-first: its tests are written and failing before any production code, per *Test-Driven Development* in `CLAUDE.md`. The verification tasks in Phase 4 are additional system-level checks, not the primary testing.
 
 ## Phase 0: Test Foundation
-- [ ] Establish the test layout: unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`, test modules allowing `unwrap`/`expect` so the zero-panic lints stay strict in production code.
-- [ ] Introduce an injectable `Clock` so `system_time` can be driven explicitly in tests, including backwards jumps that exercise the monotonicity clamp (§1).
-- [ ] Introduce an injectable sequence source so `seq` ordering is deterministic under test (§1).
-- [ ] Introduce a storage abstraction able to inject torn writes and I/O errors, so WAL recovery is tested deterministically instead of by killing processes (§4).
-- [ ] Add `proptest` and set up the invariant suite: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression idempotent.
+- [x] Establish the test layout: unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`, test modules allowing `unwrap`/`expect` so the zero-panic lints stay strict in production code.
+- [x] Introduce an injectable `Clock` so `system_time` can be driven explicitly in tests, including backwards jumps that exercise the monotonicity clamp (§1).
+- [x] Introduce an injectable sequence source so `seq` ordering is deterministic under test (§1).
+- [x] Introduce a storage abstraction able to inject torn writes and I/O errors, so WAL recovery is tested deterministically instead of by killing processes (§4).
+- [x] Add `proptest` and set up the invariant suite in `tests/invariants.rs`, with the properties the Phase 0 foundation supports.
+- [ ] Carried to Phase 1 — the three §1 invariants describe components that do not exist yet: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression idempotent.
 
 ## Phase 1: Data Model & Ingestion Engine
 - [ ] Define dynamic Arrow Schema builder (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with multi-table registry and evolution rules: nullable column added = accept, column missing = null, type change = reject with explicit Flight error. Reject client batches supplying the reserved `system_time`/`seq` columns (§6, §10).

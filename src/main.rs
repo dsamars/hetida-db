@@ -3,21 +3,19 @@
 //
 // hetida is a registered trademark of fuseki GmbH.
 
-//! hetida-db — a high-performance time-series archiver.
+//! Server binary for hetida-db.
 //!
-//! Ingests Arrow `RecordBatch` streams over Arrow Flight, makes them durable in
-//! a write-ahead log, buffers them in an in-memory table, and archives them as
-//! date-partitioned Parquet files that DataFusion queries alongside the
-//! not-yet-flushed memory state.
-//!
-//! See `ARCHITECTURE.md` for the design decisions this implementation follows.
-
-#![warn(missing_docs)]
+//! The engine lives in the `hetida_db` library; this binary only starts it.
 
 /// Process entry point.
 ///
-/// Will start the Arrow Flight server once the ingestion layer exists; for now
-/// this is the cargo-generated placeholder (see Phase 1 in `tasks.md`).
+/// Will start the Arrow Flight server once the ingestion layer exists (Phase 1
+/// in `tasks.md`). Phase 0 delivered only the test foundation, so there is
+/// nothing to serve yet.
 fn main() {
-    println!("Hello, world!");
+    println!(
+        "{} {} — no server implemented yet, see tasks.md",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
 }
