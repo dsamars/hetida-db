@@ -5,6 +5,15 @@
 
 Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 
+Every task is executed test-first: its tests are written and failing before any production code, per *Test-Driven Development* in `CLAUDE.md`. The verification tasks in Phase 4 are additional system-level checks, not the primary testing.
+
+## Phase 0: Test Foundation
+- [ ] Establish the test layout: unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`, test modules allowing `unwrap`/`expect` so the zero-panic lints stay strict in production code.
+- [ ] Introduce an injectable `Clock` so `system_time` can be driven explicitly in tests, including backwards jumps that exercise the monotonicity clamp (§1).
+- [ ] Introduce an injectable sequence source so `seq` ordering is deterministic under test (§1).
+- [ ] Introduce a storage abstraction able to inject torn writes and I/O errors, so WAL recovery is tested deterministically instead of by killing processes (§4).
+- [ ] Add `proptest` and set up the invariant suite: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression idempotent.
+
 ## Phase 1: Data Model & Ingestion Engine
 - [ ] Define dynamic Arrow Schema builder (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with multi-table registry and evolution rules: nullable column added = accept, column missing = null, type change = reject with explicit Flight error. Reject client batches supplying the reserved `system_time`/`seq` columns (§6, §10).
 - [ ] Build the persistent metric registry mapping name + label set to a `u64` id, idempotent on re-registration, written through the WAL and exposed as a queryable catalog table (§10).
@@ -12,7 +21,7 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 - [ ] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [ ] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
 - [ ] Implement retransmission suppression: discard an incoming version whose payload is byte-identical to the current latest version of the same logical row (§1).
-- [ ] Implement day-partition routing: split each incoming `RecordBatch` by day at insert time, since one batch may span day boundaries (§3).
+- [ ] Implement partition routing: split each incoming `RecordBatch` by the configured interval at insert time, since one batch may span interval boundaries (§3, §11).
 - [ ] Implement freeze-and-swap so a flush never blocks ingestion: freeze the active `MemTable`, open a new one, hand the frozen one to the background writer (§2).
 - [ ] Build append-only WAL with group commit (shared fsync, configurable max delay), per-record CRC, segment rotation, and checkpoint records for segment reclamation (§4).
 - [ ] Implement WAL replay: apply segments in sequence order, truncate at the first torn record, never fail startup on a damaged tail (§4).
@@ -21,10 +30,11 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 
 ## Phase 2: Parquet Storage & Archiver
 - [ ] Implement Parquet writer with ZSTD compression and explicit Min/Max column index generation, including `system_time` so old observation points can skip whole row groups (§1).
-- [ ] Implement date/time directory partitioner (`/year=YYYY/month=MM/day=DD/`).
+- [ ] Implement the parameterised Hive-style partitioner for the `hour`/`day`/`month`/`year` intervals, taking the interval as an argument rather than a global (§11).
+- [ ] Persist the partition interval in the instance metadata at initialisation and validate it against the on-disk layout at startup, refusing to start on a mismatch (§11).
 - [ ] Build background flusher transferring frozen `MemTable`s to Parquet, triggered per partition by size cap or max age — whichever fires first — writing `part-<seq>.parquet` sorted by `(metric_id, timestamp, seq)` with all versions preserved (§1, §2, §3).
-- [ ] Build background compactor merging and re-sorting a partition's files into `(metric_id, timestamp, seq)` order once file count or total size crosses a threshold. It must never drop a version (§1, §3).
-- [ ] Implement per-table retention configuration and a background reaper dropping whole day-partition directories once their day is entirely past the cutoff, by event time (§8).
+- [ ] Build background compactor merging and re-sorting a partition's files into `(metric_id, timestamp, seq)` order once file count or total size crosses a threshold, emitting files of a configurable target size with disjoint `(metric_id, timestamp)` ranges. It must never drop a version (§1, §3, §11).
+- [ ] Implement per-table retention configuration and a background reaper dropping whole partition directories once their interval is entirely past the cutoff, by event time (§8).
 - [ ] Reject ingestion of data already outside the retention window in `do_put` with an explicit Flight error (§8).
 
 ## Phase 3: High-Performance Query Engine & Arrow Flight Output
@@ -48,5 +58,6 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 - [ ] Benchmark as-of query latency against version depth (1, 10, 100 versions per logical row) to confirm the streaming merge does not degrade into a full sort.
 - [ ] Verify crash recovery: kill mid-write, confirm startup succeeds, acked data survives, the registry is intact, and replay is deterministic.
 - [ ] Verify metric pruning: a query on a few metrics out of many reads only the matching row groups, measured by bytes scanned rather than wall time (§11).
+- [ ] Benchmark the partition interval variants (`hour`/`day`/`month`/`year`) against the real workload — few metrics over weeks to months — reporting files opened, bytes scanned and latency, to settle the default empirically (§11).
 - [ ] Verify retention: expired partitions are dropped, live partitions stay untouched, expired-range ingestion is rejected.
 - [ ] Verify authorization: unauthenticated calls are refused, and per-table grants are enforced on both `do_put` and `do_get`.

@@ -23,12 +23,27 @@
 - **WAL Must Not Block Startup:** A torn tail record after a crash truncates the log at that point. Never fail to start on a damaged last record.
 - **Explicit Rejection Over Unbounded Buffering:** Under overload, apply gRPC flow control and — past the hard memory cap — return `RESOURCE_EXHAUSTED`. Never buffer without bound, never block indefinitely.
 - **Auth Off The Hot Path:** Validate the bearer token once per call in the interceptor, never per streamed message. One `do_put` stream carries many `RecordBatch` messages behind a single authorization.
-- **Retention Deletes Whole Partitions:** Expired data is removed by dropping day-partition directories. Never rewrite a Parquet file to delete expired rows.
+- **Retention Deletes Whole Partitions:** Expired data is removed by dropping partition directories. Never rewrite a Parquet file to delete expired rows.
+- **Partition Interval Is Immutable:** Never derive a partition path from a hardcoded granularity. The interval comes from instance configuration and is validated against the on-disk layout at startup; a mismatch is a startup error, never a silent second layout.
 - **Unsafe Code:** `unsafe` is strictly forbidden unless required for SIMD/Arrow operations and must be heavily documented with a `# Safety` block.
-- **Quality Gate:** `cargo test` and `cargo clippy -- -D warnings` MUST pass before completing tasks.
+- **Quality Gate:** `cargo test` and `cargo clippy -- -D warnings` MUST pass before completing tasks. No production code is written without a failing test that demanded it — see *Test-Driven Development*.
 - **Document Every Item:** Every module, struct, enum, trait, function and method carries a doc comment (`//!` / `///`) stating what it does and any invariant the caller must uphold — short and substantive, not a restatement of the signature. Enforced by `#![warn(missing_docs)]`.
 - **File Headers:** Every source file starts with the SPDX identifier and copyright notice (see *Legal*).
 - **Concurrency:** Ensure all thread synchronization uses lock-free datastructures (`crossbeam`, `dashmap`, `atomic`) or asynchronous channels (`tokio::sync::mpsc`). Avoid coarse-grained `Mutex` in the ingestion path.
+
+## Test-Driven Development
+
+Development is strictly test-driven. This is not a style preference — it constrains the design, and the constraints below are binding.
+
+- **Red-green-refactor, in that order.** Write a failing test, make it pass with the simplest code that does, then refactor. Never write production code that no failing test asked for. Every task in `tasks.md` begins with its tests.
+- **Every decision in `ARCHITECTURE.md` needs a test that fails when it is violated.** That, not line coverage, is the measure of whether this codebase is tested. A test guarding a decision names it in a comment (`// §1: …`).
+- **Injectable clock.** Wall-clock time is never read directly. A `Clock` trait supplies `system_time`; production uses the system clock, tests drive it explicitly — including backwards jumps, to exercise the monotonicity clamp of §1. Time travel is untestable otherwise.
+- **Injectable sequence source.** `seq` comes from an injected generator so version ordering is deterministic under test.
+- **Storage abstraction with fault injection.** WAL recovery is tested by injecting torn writes and I/O errors, not by killing processes. A crash test that cannot be reproduced deterministically is not a test.
+- **Deterministic tests only.** No `sleep`, no wall-clock assertions, no fixed ports. Use `tokio::time::pause()` for time-dependent async paths and port 0 for servers. A flaky test is treated as a failing test.
+- **Property-based tests (`proptest`) for the invariants**, because examples cannot cover them: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression being idempotent.
+- **Test layout:** unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`. Test modules carry `#[allow(clippy::unwrap_used, clippy::expect_used)]` — the zero-panic policy applies to production code, and tests may panic freely.
+- **Benchmarks are not tests.** Phase 4 measures; correctness is settled long before it.
 
 ## Tech Stack
 - **Protocol & Network:** Pure Apache Arrow Flight (`arrow-flight` crate over `tonic` gRPC transport)

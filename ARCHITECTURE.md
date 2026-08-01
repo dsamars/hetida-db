@@ -33,9 +33,11 @@
                    ▼                                       ▼
         ┌────────────────────────────┐            ┌──────────────────────────┐
         │ Parquet Files              │            │ DataFusion Vectorized    │
-        │ /year=YYYY/month=MM/day=DD/│            │ Query Plan               │
+        │ /year=YYYY/month=MM/       │            │ Query Plan               │
         └────────────────────────────┘            └──────────────────────────┘
 ```
+
+The partition depth is configurable (§11); the diagram shows the `month` default.
 
 ## Design Decisions
 
@@ -61,14 +63,14 @@ The archive is **bitemporal**. Two independent time axes:
 ### 2. MemTable & Flush
 
 - **Trigger:** whichever fires first — per-partition size cap, or maximum age. Size bounds memory and yields well-sized row groups; age bounds the data-loss window and query staleness for low-rate metrics.
-- **Granularity:** flush per day partition, never globally. A global flush writes into many partitions at once and scatters small files.
+- **Granularity:** flush per partition, never globally. A global flush writes into many partitions at once and scatters small files.
 - **Non-blocking:** freeze the active `MemTable`, open a new one, write the frozen one in the background. Ingestion never waits for a flush.
 - **Sorted output:** every flush writes rows ordered by `(metric_id, timestamp, seq)` and preserves all versions (§1).
 
 ### 3. Late-Arriving Data & Compaction
 
 - **All data is accepted regardless of age.** Nothing is dropped by a lateness watermark — this is an archiver. The single exception is data already outside the configured retention window, which is rejected explicitly (§8).
-- A `RecordBatch` is split by day at insert time and routed to the matching partition, since one batch may span day boundaries.
+- A `RecordBatch` is split by partition interval (§11) at insert time and routed to the matching partitions, since one batch may span interval boundaries.
 - Each flush writes a new `part-<seq>.parquet` into its partition.
 - A background **compactor** merges and re-sorts a partition's files into `(metric_id, timestamp, seq)` order once file count or total size crosses a threshold. It **never drops a version** — its purpose is file count and scan efficiency, not version resolution (§1).
 
@@ -102,8 +104,9 @@ The archive is **bitemporal**. Two independent time axes:
 ### 8. Retention & TTL
 
 - **Configured per table** as a duration. Unset means keep forever.
-- **Time basis is event time** — the day partition a row belongs to, not its ingestion time. The Hive-style layout already encodes this, so the reaper needs no additional index.
-- **Granularity is the whole day partition.** A background reaper drops a partition directory once its entire day is older than the cutoff. Never partial deletion: removing rows from inside a Parquet file means rewriting it, which is compaction's job, not retention's.
+- **Time basis is event time** — the partition a row belongs to, not its ingestion time. The Hive-style layout already encodes this, so the reaper needs no additional index.
+- **Granularity is the whole partition,** and therefore follows the configured partition interval (§11). A background reaper drops a partition directory once its entire interval is older than the cutoff. Never partial deletion: removing rows from inside a Parquet file means rewriting it, which is compaction's job, not retention's.
+- **Coarse intervals over-retain.** With `month` partitions and a 90-day policy, data survives until its whole month clears the cutoff — up to roughly 120 days. Retention resolution can never be finer than the partition interval; choose the two together.
 - **Ingesting already-expired data is rejected** with an explicit Flight error rather than written and reaped moments later. This is the one age-based rejection in the system, and it is an explicit configured policy — not the lateness watermark that §3 rules out.
 - **Out of scope for v1:** downsampling or rollup before deletion. That is an aggregation feature, not a retention policy.
 
@@ -111,7 +114,7 @@ Retention has a **second, independent dimension** since §1:
 
 - **Version retention is unbounded by default** — every correction is kept forever and time travel reaches back to the first write. For an archive with audit expectations, silently forgetting history is the worse surprise.
 - An optional per-table horizon may let compaction collapse superseded versions older than it. The horizon *is* the time-travel reach, so shortening it destroys history — it must never be applied implicitly.
-- The two dimensions are orthogonal: event-time retention drops whole day partitions, version retention thins the history within surviving partitions.
+- The two dimensions are orthogonal: event-time retention drops whole partitions, version retention thins the history within surviving partitions.
 
 ### 9. Authentication & Authorization
 
@@ -134,14 +137,28 @@ Retention has a **second, independent dimension** since §1:
 
 ### 11. Partition Layout
 
-- **The partition path stays `/year=YYYY/month=MM/day=DD/`. No `metric_id` level.** It would create days × metrics directories — at 100 000 metrics roughly 36.5 million files per year, each with Parquet footer overhead, compression and read throughput destroyed, and every flush emitting one tiny file per metric.
+- **The partition interval is a parameter, fixed when an instance is initialized.** Valid values are `hour`, `day`, `month`, `year`; the default is `month`.
+  - Typical queries span weeks to months over a few metrics. A month-granular layout answers those from one to three directories, where a day-granular one opens thirty to ninety and pays a footer read on each to retrieve a few kilobytes per metric — metadata overhead, not scan volume, dominates that pattern.
+- **Calendar-aligned intervals only, never arbitrary durations.** The Hive path encodes calendar fields, so a `WHERE timestamp BETWEEN …` predicate maps straight onto partition columns DataFusion can prune. An arbitrary duration would require a synthetic bucket column and lose that mapping.
+
+  | Interval | Path |
+  |---|---|
+  | `hour` | `/year=YYYY/month=MM/day=DD/hour=HH/` |
+  | `day` | `/year=YYYY/month=MM/day=DD/` |
+  | `month` | `/year=YYYY/month=MM/` |
+  | `year` | `/year=YYYY/` |
+
+- **The interval is immutable once data exists.** It is baked into the directory structure, so changing it means rewriting every file. It is persisted in the instance metadata and validated against the on-disk layout at startup; a mismatch refuses to start rather than silently building a second, incompatible layout beside the first.
+- **The partitioner receives the interval as a parameter** rather than reading a global, so a later per-table override is a configuration change instead of a rewrite.
+- **Compaction target file size is a separate parameter.** A coarse interval on a high-rate table must still compact into several files rather than one enormous one. Because compaction merges in sort order, each output file covers a disjoint `(metric_id, timestamp)` range, so whole files can be skipped before their footers are read.
+- **No `metric_id` level, at any interval.** It would create intervals × metrics directories — at 100 000 metrics and day granularity roughly 36.5 million files per year, each with Parquet footer overhead, compression and read throughput destroyed, and every flush emitting one tiny file per metric.
 - **Metric pruning comes from the sort order instead.** Files sorted by `(metric_id, timestamp, seq)` (§1) keep each metric's rows contiguous, so row-group min/max statistics and the page-level column index skip everything outside the queried metrics. This is precisely why the sort is metric-major: under `(timestamp, metric_id)` a metric's rows would scatter across every row group and pruning would fail.
 - **No Bloom filters on `metric_id`.** They address unsorted columns; min/max is already optimal on a sorted one.
-- **Escalation path** — should measurement ever show this insufficient, the answer is hash bucketing, `/year=YYYY/month=MM/day=DD/bucket=H/` with `H = hash(metric_id) % N` for a small fixed N (16–64), sized so a bucket's daily file stays above ~100 MB. Not metric-level partitioning. Note that range predicates on `metric_id` stop pruning under bucketing, and changing N later requires a full rewrite.
+- **Escalation path** — should measurement ever show this insufficient, the answer is hash bucketing, a `bucket=H` level below the interval with `H = hash(metric_id) % N` for a small fixed N (16–64), sized so a bucket's per-interval file stays above ~100 MB. Not metric-level partitioning. Note that range predicates on `metric_id` stop pruning under bucketing, and changing N later requires a full rewrite.
 
 ## Open Questions
 
 - **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
 - **Downsampling / rollup** before retention deletion (§8) — deferred.
 - **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.
-- **Coarsening aged partitions** (§11) — if few-metric queries commonly span long time ranges, a year-long query opens 365 directories to read a few kilobytes from each. The lever would be compaction merging closed months into a single monthly file, not finer partitioning. Depends on the real query time ranges, which are not yet known.
+- **Tiered partition intervals** (§11) — fine granularity for recent data, coarse for aged. Not needed for the stated weeks-to-months query pattern, which a flat configurable interval already serves; deferred unless measurement contradicts it.
