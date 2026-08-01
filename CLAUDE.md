@@ -12,11 +12,13 @@
 - Format: `cargo fmt`
 
 ## Critical Performance & Quality Rules
-- **No Per-Row Copies In Hot Path:** Ingestion (`DoPut`) and Querying (`DoGet`) must pass `RecordBatch` instances through unchanged — from Arrow IPC decode to Parquet writer and back. No conversion into Rust structs, no row-by-row iteration, no re-batching outside the flush path. (Buffer allocation during IPC decode is unavoidable and not covered by this rule.)
+- **No Per-Row Copies In Hot Path:** Ingestion (`DoPut`) and Querying (`DoGet`) must pass `RecordBatch` instances through unchanged — from Arrow IPC decode to Parquet writer and back. No conversion into Rust structs, no row-by-row iteration, no re-batching outside the flush path. Two explicit exceptions: buffer allocation during IPC decode is unavoidable; and appending the `system_time`/`seq` system columns is permitted, because the client's column buffers are moved by `Arc`, not copied — only the schema and the two new arrays are built.
 - **Pure Arrow Flight Protocol:** Do not introduce pure Protobuf messaging for time-series payload data. Use Arrow Flight `FlightService` (`DoPut` for writes, `DoGet` for reads).
 - **Zero Panic Policy:** No `unwrap()` or `expect()` in ingestion pipelines, WAL parsing, or Flight handlers. Enforce it mechanically in those modules: `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]`.
 - **Non-Blocking Flush:** Ingestion must never wait on a flush. Freeze the active `MemTable` and open a new one; the frozen one is written in the background.
-- **No Wall-Clock Ordering:** Order and conflict resolution use the monotonic ingestion sequence number, never system time. Wall-clock can move backwards and makes WAL replay non-deterministic.
+- **No Wall-Clock Ordering:** Ordering and version resolution use the monotonic `seq`, never wall-clock time — it can move backwards and makes WAL replay non-deterministic. `system_time` is a user-visible *stamp* for time-travel predicates, not an ordering source, and must be clamped so it never decreases as `seq` increases.
+- **Versions Are Immutable:** Never overwrite, replace or drop a row version — not in the `MemTable`, not on flush, not during compaction. Time travel depends on the full history being present; resolution belongs to the read path alone. The sole write-path exception is retransmission suppression (byte-identical payload), and the sole delete path is retention (`ARCHITECTURE.md` §8).
+- **Preserve Sort Order:** Every flushed and compacted file is ordered by `(metric_id, timestamp, seq)`. Version resolution is a streaming merge and silently degrades to a full sort if this is broken.
 - **WAL Must Not Block Startup:** A torn tail record after a crash truncates the log at that point. Never fail to start on a damaged last record.
 - **Explicit Rejection Over Unbounded Buffering:** Under overload, apply gRPC flow control and — past the hard memory cap — return `RESOURCE_EXHAUSTED`. Never buffer without bound, never block indefinitely.
 - **Auth Off The Hot Path:** Validate the bearer token once per call in the interceptor, never per streamed message. One `do_put` stream carries many `RecordBatch` messages behind a single authorization.
@@ -48,4 +50,6 @@
 
 ## Design Decisions
 
-Settled architectural decisions — deduplication, flush, compaction, WAL, Flight surface, schema evolution, backpressure — are recorded in `ARCHITECTURE.md` under *Design Decisions*. Read them before implementing; do not re-decide them ad hoc.
+Settled architectural decisions — bitemporal versioning and time travel, flush, compaction, WAL, Flight surface, schema evolution, backpressure, retention, auth — are recorded in `ARCHITECTURE.md` under *Design Decisions*. Read them before implementing; do not re-decide them ad hoc.
+
+The archive is **bitemporal**: `timestamp` is valid time, `system_time`/`seq` is system time. Many versions of `(metric_id, timestamp)` coexist and a query resolves the newest one at an optional observation point. Anything that discards a version is a bug — see §1.
