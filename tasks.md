@@ -6,7 +6,9 @@
 Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 
 ## Phase 1: Data Model & Ingestion Engine
-- [ ] Define dynamic Arrow Schema builder (`timestamp`, `metric_id`, attributes as real typed columns) with multi-table registry and evolution rules: nullable column added = accept, column missing = null, type change = reject with explicit Flight error. Reject client batches supplying the reserved `system_time`/`seq` columns (§6).
+- [ ] Define dynamic Arrow Schema builder (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with multi-table registry and evolution rules: nullable column added = accept, column missing = null, type change = reject with explicit Flight error. Reject client batches supplying the reserved `system_time`/`seq` columns (§6, §10).
+- [ ] Build the persistent metric registry mapping name + label set to a `u64` id, idempotent on re-registration, written through the WAL and exposed as a queryable catalog table (§10).
+- [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
 - [ ] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [ ] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
 - [ ] Implement retransmission suppression: discard an incoming version whose payload is byte-identical to the current latest version of the same logical row (§1).
@@ -29,7 +31,8 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 - [ ] Build DataFusion execution pipeline combining `MemTable` memory state and `Parquet` disk storage.
 - [ ] Implement as-of version resolution: filter `system_time <= observation point`, then take the highest `seq` per `(metric_id, timestamp)` as a streaming merge over the sorted files — not a full-sort window function (§1).
 - [ ] Expose each table as an as-of-resolved view plus `<table>$history` carrying the raw versions with `system_time` and `seq` as ordinary columns (§1, §5).
-- [ ] Implement predicate pushdown and column projection for Parquet readers, including partition pruning via the Hive-style layout and row-group skipping on `system_time`.
+- [ ] Implement predicate pushdown and column projection for Parquet readers, including partition pruning via the Hive-style layout and row-group skipping on `system_time` and `metric_id` (§11).
+- [ ] Resolve label predicates against the registry into a `metric_id` set and push that down as a filter on `metric_id` (§10).
 - [ ] Implement `get_flight_info` and `get_schema` so generic Flight clients can follow the standard `get_flight_info` → `do_get` flow, accepting the same `{sql, as_of}` payload in the descriptor `cmd` (§5).
 - [ ] Implement Arrow Flight `do_get` endpoint: parse `{sql, as_of}` from the `Ticket`, run it through DataFusion and stream results directly to clients via Arrow IPC (§5).
 - [ ] Implement TLS termination and Flight `Handshake` issuing bearer tokens, validated by a `tonic` interceptor once per call — never per streamed message (§9).
@@ -43,6 +46,7 @@ Design decisions referenced below (§n) are recorded in `ARCHITECTURE.md`.
 - [ ] Verify time travel: write a value, correct it, and confirm each observation point returns the version current at that point — before the first write, between the two, and after. Include corrections that land after their partition was flushed and compacted.
 - [ ] Verify retransmission suppression: re-sending an identical batch creates no new version and leaves every observation point's answer unchanged.
 - [ ] Benchmark as-of query latency against version depth (1, 10, 100 versions per logical row) to confirm the streaming merge does not degrade into a full sort.
-- [ ] Verify crash recovery: kill mid-write, confirm startup succeeds, acked data survives, and replay is deterministic.
+- [ ] Verify crash recovery: kill mid-write, confirm startup succeeds, acked data survives, the registry is intact, and replay is deterministic.
+- [ ] Verify metric pruning: a query on a few metrics out of many reads only the matching row groups, measured by bytes scanned rather than wall time (§11).
 - [ ] Verify retention: expired partitions are dropped, live partitions stay untouched, expired-range ingestion is rejected.
 - [ ] Verify authorization: unauthenticated calls are refused, and per-table grants are enforced on both `do_put` and `do_get`.

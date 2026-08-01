@@ -92,6 +92,7 @@ The archive is **bitemporal**. Two independent time axes:
 - **Attributes are real typed columns**, not a `Map<Utf8, Utf8>` column. A map column would forfeit both compression and predicate pushdown on attributes — the two properties the columnar archive exists for.
 - **Evolution rules:** adding a nullable column is accepted; a missing column reads as null; a type change on an existing column rejects the batch with an explicit Flight error. Parquet and DataFusion merge schemas across files as long as additions are nullable.
 - **`system_time` and `seq` are reserved column names** (§1). A client batch that supplies either is rejected — the server owns those columns.
+- **Labels are not attribute columns.** They belong to the series identity and live in the registry (§10); attribute columns carry payload only, such as values and quality flags.
 
 ### 7. Backpressure
 
@@ -121,8 +122,26 @@ Retention has a **second, independent dimension** since §1:
 - **Credential store is pluggable** behind a trait; v1 ships a static configuration file. OIDC/JWT and mTLS client certificates are later backends.
 - Authentication is a precondition for the query cost limits noted in §5, not a substitute for them: an authenticated client can still submit a ruinous query.
 
+### 10. Metric Identity & Registry
+
+- **`metric_id` is the full series identity** — the metric name *plus* its complete label set — resolved to a `u64` surrogate by a persistent registry.
+  - *Rationale:* §1 identifies a logical row by `(metric_id, timestamp)`. If labels were payload, two parallel series sharing a name and a timestamp would collapse into one logical row and the second would be recorded as a **correction** of the first. Time travel would then report a change that never happened.
+- **The type is `u64`.** The sort key `(metric_id, timestamp, seq)` is then 24 bytes of fixed width — cheap to compare in merge and radix sorts, cheap to hash in the `MemTable`, compact in Parquet min/max statistics. Rejected alternatives: `Utf8` puts variable-length string comparison in the hottest path; `Dictionary<UInt32, Utf8>` requires dictionary unification across every batch and file; a hash of the name carries a collision probability unacceptable for an audited archive.
+- **Resolution happens on the client, never on ingest.** Clients obtain ids once through a registration action, cache them, and send `u64` in `do_put`. Server-side name resolution would be a per-row lookup in the hot path.
+- **Registration is idempotent:** the same name and label set always yields the same id.
+- **Labels live in the registry only** and are not repeated in the data files. A label predicate resolves against the registry to a set of `metric_id`s first, which then pushes down as a filter on `metric_id`. The registry holds one row per series and is small enough to scan; the fact table stays narrow.
+- **The registry is critical state.** Without it the archive cannot be interpreted. It is written through the WAL like ingested data, belongs in every backup, and is exposed as a queryable catalog table.
+
+### 11. Partition Layout
+
+- **The partition path stays `/year=YYYY/month=MM/day=DD/`. No `metric_id` level.** It would create days × metrics directories — at 100 000 metrics roughly 36.5 million files per year, each with Parquet footer overhead, compression and read throughput destroyed, and every flush emitting one tiny file per metric.
+- **Metric pruning comes from the sort order instead.** Files sorted by `(metric_id, timestamp, seq)` (§1) keep each metric's rows contiguous, so row-group min/max statistics and the page-level column index skip everything outside the queried metrics. This is precisely why the sort is metric-major: under `(timestamp, metric_id)` a metric's rows would scatter across every row group and pruning would fail.
+- **No Bloom filters on `metric_id`.** They address unsorted columns; min/max is already optimal on a sorted one.
+- **Escalation path** — should measurement ever show this insufficient, the answer is hash bucketing, `/year=YYYY/month=MM/day=DD/bucket=H/` with `H = hash(metric_id) % N` for a small fixed N (16–64), sized so a bucket's daily file stays above ~100 MB. Not metric-level partitioning. Note that range predicates on `metric_id` stop pruning under bucketing, and changing N later requires a full rewrite.
+
 ## Open Questions
 
 - **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
 - **Downsampling / rollup** before retention deletion (§8) — deferred.
 - **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.
+- **Coarsening aged partitions** (§11) — if few-metric queries commonly span long time ranges, a year-long query opens 365 directories to read a few kilobytes from each. The lever would be compaction merging closed months into a single monthly file, not finer partitioning. Depends on the real query time ranges, which are not yet known.
