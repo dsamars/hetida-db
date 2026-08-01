@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 Heiko Dietz -->
+
 # High-Performance Parquet Time-Series Archiver
 
 ## Core Commands
@@ -20,6 +23,8 @@
 - **Retention Deletes Whole Partitions:** Expired data is removed by dropping day-partition directories. Never rewrite a Parquet file to delete expired rows.
 - **Unsafe Code:** `unsafe` is strictly forbidden unless required for SIMD/Arrow operations and must be heavily documented with a `# Safety` block.
 - **Quality Gate:** `cargo test` and `cargo clippy -- -D warnings` MUST pass before completing tasks.
+- **Document Every Item:** Every module, struct, enum, trait, function and method carries a doc comment (`//!` / `///`) stating what it does and any invariant the caller must uphold — short and substantive, not a restatement of the signature. Enforced by `#![warn(missing_docs)]`.
+- **File Headers:** Every source file starts with the SPDX identifier and copyright notice (see *Legal*).
 - **Concurrency:** Ensure all thread synchronization uses lock-free datastructures (`crossbeam`, `dashmap`, `atomic`) or asynchronous channels (`tokio::sync::mpsc`). Avoid coarse-grained `Mutex` in the ingestion path.
 
 ## Tech Stack
@@ -28,6 +33,18 @@
 - **Query Processing:** Apache DataFusion (`datafusion`)
 - **Error Handling:** `thiserror` for library/domain logic, `anyhow` for startup/CLI.
 - **Version Alignment:** `arrow`, `parquet`, `arrow-flight` and `datafusion` must resolve to the same Arrow major version, otherwise Arrow types conflict across crate boundaries. Pick the DataFusion version first and derive the rest from its Arrow dependency.
+
+## Legal
+
+- **Author:** Heiko Dietz
+- **License:** MIT — `Copyright (c) 2026 Heiko Dietz`. Full text in `LICENSE`.
+- **Trademark:** *hetida* is a registered trademark of fuseki GmbH. The MIT License covers the source code only and grants no trademark rights; forks must be renamed.
+- Every new `.rs` file begins with:
+  ```rust
+  // SPDX-License-Identifier: MIT
+  // Copyright (c) 2026 Heiko Dietz
+  ```
+  Markdown and TOML files carry the same two lines as `<!-- -->` / `#` comments.
 
 ## Design Decisions
 

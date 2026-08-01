@@ -1,6 +1,15 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+#
+# hetida is a registered trademark of fuseki GmbH.
+
 [package]
 name = "hetida-db"
 version = "0.1.0"
 edition = "2024"
+authors = ["Heiko Dietz <hdietz@outlook.com>"]
+description = "High-performance time-series archiver built on Apache Arrow Flight, Parquet and DataFusion"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
