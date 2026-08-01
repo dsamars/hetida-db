@@ -53,7 +53,7 @@ These are settled. Reopen only with a reason recorded here.
 
 ### 3. Late-Arriving Data & Compaction
 
-- **All data is accepted regardless of age.** Nothing is dropped by a watermark — this is an archiver.
+- **All data is accepted regardless of age.** Nothing is dropped by a lateness watermark — this is an archiver. The single exception is data already outside the configured retention window, which is rejected explicitly (§8).
 - A `RecordBatch` is split by day at insert time and routed to the matching partition, since one batch may span day boundaries.
 - Each flush writes a new `part-<seq>.parquet` into its partition.
 - A background **compactor** merges, sorts and deduplicates a partition's files once file count or total size crosses a threshold. This is what makes deduplication complete across flush windows; without it §1 holds only per flush window.
@@ -82,7 +82,25 @@ These are settled. Reopen only with a reason recorded here.
 - Bounded queues. When full, stop reading from the `do_put` stream and let gRPC flow control propagate the pressure back to the client — no protocol extension needed.
 - **Hard limit:** if total `MemTable` memory exceeds the cap *and* flushing is falling behind, return `RESOURCE_EXHAUSTED`. Blocking indefinitely is worse than an explicit rejection, because the client then only sees a timeout without a cause.
 
+### 8. Retention & TTL
+
+- **Configured per table** as a duration. Unset means keep forever.
+- **Time basis is event time** — the day partition a row belongs to, not its ingestion time. The Hive-style layout already encodes this, so the reaper needs no additional index.
+- **Granularity is the whole day partition.** A background reaper drops a partition directory once its entire day is older than the cutoff. Never partial deletion: removing rows from inside a Parquet file means rewriting it, which is compaction's job, not retention's.
+- **Ingesting already-expired data is rejected** with an explicit Flight error rather than written and reaped moments later. This is the one age-based rejection in the system, and it is an explicit configured policy — not the lateness watermark that §3 rules out.
+- **Out of scope for v1:** downsampling or rollup before deletion. That is an aggregation feature, not a retention policy.
+
+### 9. Authentication & Authorization
+
+- **Transport:** TLS, terminated by `tonic`.
+- **Authentication:** Flight `Handshake` exchanges credentials for a bearer token. Every subsequent call carries it in the `authorization` call metadata, validated by a `tonic` interceptor.
+- **Validation runs once per call, never per message.** A `do_put` stream carries many `RecordBatch` messages behind a single authorization; checking per message would put token validation in the hot path.
+- **Authorization:** per-table read/write grants, checked against the table resolved from `FlightDescriptor::path` for `do_put` and from the parsed SQL for `do_get`. Multi-table is already given (§6), so table level is the natural granularity.
+- **Credential store is pluggable** behind a trait; v1 ships a static configuration file. OIDC/JWT and mTLS client certificates are later backends.
+- Authentication is a precondition for the query cost limits noted in §5, not a substitute for them: an authenticated client can still submit a ruinous query.
+
 ## Open Questions
 
-- **Retention / TTL** — undecided. Without it the archive grows without bound.
-- **Authentication** — undecided. Flight provides `Handshake` for this.
+- **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
+- **Downsampling / rollup** before retention deletion (§8) — deferred.
+- **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.

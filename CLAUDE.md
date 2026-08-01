@@ -16,6 +16,8 @@
 - **No Wall-Clock Ordering:** Order and conflict resolution use the monotonic ingestion sequence number, never system time. Wall-clock can move backwards and makes WAL replay non-deterministic.
 - **WAL Must Not Block Startup:** A torn tail record after a crash truncates the log at that point. Never fail to start on a damaged last record.
 - **Explicit Rejection Over Unbounded Buffering:** Under overload, apply gRPC flow control and — past the hard memory cap — return `RESOURCE_EXHAUSTED`. Never buffer without bound, never block indefinitely.
+- **Auth Off The Hot Path:** Validate the bearer token once per call in the interceptor, never per streamed message. One `do_put` stream carries many `RecordBatch` messages behind a single authorization.
+- **Retention Deletes Whole Partitions:** Expired data is removed by dropping day-partition directories. Never rewrite a Parquet file to delete expired rows.
 - **Unsafe Code:** `unsafe` is strictly forbidden unless required for SIMD/Arrow operations and must be heavily documented with a `# Safety` block.
 - **Quality Gate:** `cargo test` and `cargo clippy -- -D warnings` MUST pass before completing tasks.
 - **Concurrency:** Ensure all thread synchronization uses lock-free datastructures (`crossbeam`, `dashmap`, `atomic`) or asynchronous channels (`tokio::sync::mpsc`). Avoid coarse-grained `Mutex` in the ingestion path.
