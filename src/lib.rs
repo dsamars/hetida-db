@@ -21,10 +21,21 @@
 //! never-reclaimed catalogue log ([`catalog_log`]), the system-column stamper
 //! ([`stamp`]), the versioned table with freeze-and-swap ([`memtable`],
 //! [`active`]) and its suppression state ([`suppression`]), the write-ahead log
-//! ([`wal`]) and the partition layout ([`partition`]).
+//! ([`wal`]), the partition layout ([`partition`]) and the routing that places a
+//! batch in it ([`table`]).
 
 #![warn(missing_docs)]
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+// The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
+// `todo` are on the list because an unreachable! in the ingest path is the same
+// outage as an unwrap — a lesson from one slipping through review.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo
+)]
 
 pub mod active;
 pub mod catalog;
@@ -39,4 +50,5 @@ pub mod seq;
 pub mod stamp;
 pub mod storage;
 pub mod suppression;
+pub mod table;
 pub mod wal;
