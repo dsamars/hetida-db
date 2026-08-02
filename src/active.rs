@@ -16,6 +16,23 @@
 //! Registering as a writer and *then* re-checking which table is current closes
 //! that window: if the table moved on, the writer retries against the new one.
 //!
+//! # Frozen tables are held, not handed away
+//!
+//! A retired table stays in [`ActiveMemTable::frozen`] until the caller that
+//! wrote it calls [`ActiveMemTable::release`]. Two things depend on that, and
+//! both used to be broken by handing the only reference to the flusher:
+//!
+//! - **A query must not lose rows to a flush.** Between the swap and the Parquet
+//!   file being durable the rows are in neither the active table nor on disk. A
+//!   reader that consulted only the active table would silently answer without
+//!   them (§5).
+//! - **A failed write must not lose them either.** The rows stay held, so the
+//!   §7 memory cap sees them and eventually refuses ingestion, which is what
+//!   that chain promises — rather than the rows vanishing with a dropped `Arc`.
+//!
+//! Release is therefore the flusher's acknowledgement that the rows are durable
+//! somewhere else, and nothing else may call it.
+//!
 //! # Suppression scope
 //!
 //! Unchanged-value suppression (§1) must reach across a freeze: the comparison
@@ -34,6 +51,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
 use crate::memtable::{InsertOutcome, MemTable, MemTableError};
+use crate::seq::Seq;
 use crate::suppression::{SuppressionConfig, SuppressionIndex};
 
 /// Holds the table currently accepting writes and swaps it out on flush.
@@ -42,6 +60,12 @@ pub struct ActiveMemTable {
     schema: SchemaRef,
     suppression: Arc<SuppressionIndex>,
     current: ArcSwap<MemTable>,
+    /// Retired tables whose rows are not yet durable elsewhere.
+    ///
+    /// Swapped whole rather than locked: the list is short — one entry per
+    /// flush in flight — and readers take a snapshot without blocking the
+    /// ingestion path, which a `Mutex` here would not (CLAUDE.md, concurrency).
+    frozen: ArcSwap<Vec<Arc<MemTable>>>,
 }
 
 impl ActiveMemTable {
@@ -68,6 +92,7 @@ impl ActiveMemTable {
             schema,
             suppression,
             current: ArcSwap::from_pointee(table),
+            frozen: ArcSwap::from_pointee(Vec::new()),
         })
     }
 
@@ -104,6 +129,11 @@ impl ActiveMemTable {
     ///
     /// Returns only once no writer remains inside the retired table, so the
     /// caller receives a table nothing can still be appending to.
+    ///
+    /// The retired table is also **retained** here until [`Self::release`] says
+    /// its rows are durable elsewhere — see the module documentation. A table
+    /// that retired empty is not retained, or a partition whose flush keeps
+    /// failing would accumulate empty tables without bound.
     pub fn freeze(&self) -> Result<Arc<MemTable>, MemTableError> {
         // The replacement borrows the same suppression state, so the retired
         // table's comparison history is not lost with it (§1).
@@ -118,7 +148,75 @@ impl ActiveMemTable {
             std::thread::yield_now();
         }
 
+        if retired.num_rows() > 0 {
+            self.frozen.rcu(|held| {
+                let mut next = Vec::with_capacity(held.len() + 1);
+                next.extend(held.iter().map(Arc::clone));
+                next.push(Arc::clone(&retired));
+                next
+            });
+        }
+
         Ok(retired)
+    }
+
+    /// Frozen tables whose rows are not yet durable elsewhere.
+    ///
+    /// A reader must union these with [`Self::current`], or it answers without
+    /// the rows a flush currently has in flight (§5).
+    pub fn frozen(&self) -> Vec<Arc<MemTable>> {
+        self.frozen.load().iter().map(Arc::clone).collect()
+    }
+
+    /// Drops a frozen table, on the caller's word that its rows are durable.
+    ///
+    /// Only the flusher may call this, and only after the Parquet file carrying
+    /// the rows has been written and renamed into place. Releasing anything not
+    /// held — including releasing twice, which a retrying flusher may do — is a
+    /// no-op rather than an error.
+    pub fn release(&self, table: &Arc<MemTable>) {
+        self.frozen.rcu(|held| {
+            held.iter()
+                .filter(|candidate| !Arc::ptr_eq(candidate, table))
+                .map(Arc::clone)
+                .collect::<Vec<_>>()
+        });
+    }
+
+    /// Rows held here, active and frozen alike, counting every version.
+    pub fn held_rows(&self) -> usize {
+        self.current().num_rows()
+            + self
+                .frozen()
+                .iter()
+                .map(|table| table.num_rows())
+                .sum::<usize>()
+    }
+
+    /// Bytes held here, active and frozen alike (§7).
+    ///
+    /// A frozen table still occupies memory until its file is durable, so the
+    /// cap has to see it — a stalled flush is exactly when the cap must bite.
+    pub fn held_bytes(&self) -> usize {
+        self.current().memory_bytes()
+            + self
+                .frozen()
+                .iter()
+                .map(|table| table.memory_bytes())
+                .sum::<usize>()
+    }
+
+    /// The lowest `seq` held here, active or frozen (§4).
+    ///
+    /// A checkpoint may never pass this: a segment covering a `seq` that exists
+    /// only in a frozen table would be reclaimed while the rows are nowhere
+    /// durable.
+    pub fn min_seq(&self) -> Option<Seq> {
+        self.frozen()
+            .iter()
+            .filter_map(|table| table.min_seq())
+            .chain(self.current().min_seq())
+            .min()
     }
 }
 
@@ -192,6 +290,119 @@ mod tests {
     #[test]
     fn a_new_holder_starts_with_an_empty_table() {
         assert_eq!(active().current().num_rows(), 0);
+    }
+
+    // ---- frozen tables stay readable (§2, §4, §7) ----
+
+    /// §2, §5: a freeze must not make rows disappear. Between the swap and the
+    /// Parquet file being durable the rows are in neither the active table nor
+    /// on disk, so the holder keeps the retired table until it is released.
+    #[test]
+    fn a_frozen_table_stays_held_until_it_is_released() {
+        let active = active();
+        active.insert(&row(1, 10, 0)).unwrap();
+
+        // Dropped straight away: the holder must retain it independently of the
+        // reference the flusher was handed.
+        drop(active.freeze().unwrap());
+
+        assert_eq!(active.current().num_rows(), 0, "the active table is fresh");
+        assert_eq!(
+            active.frozen().len(),
+            1,
+            "the retired table must still be reachable"
+        );
+        assert_eq!(active.held_rows(), 1, "and its rows still counted");
+    }
+
+    /// Released only once the rows are durable elsewhere, and then they go.
+    #[test]
+    fn releasing_a_frozen_table_lets_it_go() {
+        let active = active();
+        active.insert(&row(1, 10, 0)).unwrap();
+        let frozen = active.freeze().unwrap();
+
+        active.release(&frozen);
+
+        assert!(active.frozen().is_empty());
+        assert_eq!(active.held_rows(), 0);
+    }
+
+    /// A freeze that retires nothing must retain nothing, or a partition whose
+    /// flush keeps failing would accumulate empty tables forever.
+    #[test]
+    fn freezing_an_empty_table_retains_nothing() {
+        let active = active();
+        assert_eq!(active.freeze().unwrap().num_rows(), 0);
+        assert!(active.frozen().is_empty());
+    }
+
+    /// §7: the memory cap has to see frozen tables. They occupy memory until
+    /// their file is durable, and a stalled flush is exactly when the cap must
+    /// bite.
+    #[test]
+    fn held_bytes_counts_frozen_tables_as_well_as_the_active_one() {
+        let active = active();
+        active.insert(&row(1, 10, 0)).unwrap();
+        let before = active.held_bytes();
+        assert!(before > 0);
+
+        let frozen = active.freeze().unwrap();
+        assert_eq!(
+            active.held_bytes(),
+            before,
+            "freezing must not make the memory look free"
+        );
+
+        active.release(&frozen);
+        assert_eq!(active.held_bytes(), 0);
+    }
+
+    /// §4: the checkpoint watermark may never pass a `seq` that is only in a
+    /// frozen table — a segment covering it would be reclaimed while the rows
+    /// exist nowhere durable.
+    #[test]
+    fn the_lowest_held_seq_includes_frozen_tables() {
+        let active = active();
+        active.insert(&row(1, 10, 5)).unwrap();
+        let frozen = active.freeze().unwrap();
+        active.insert(&row(1, 20, 9)).unwrap();
+
+        assert_eq!(active.min_seq(), Some(5), "the frozen table holds seq 5");
+        active.release(&frozen);
+        assert_eq!(active.min_seq(), Some(9));
+    }
+
+    /// Several flushes may be in flight, so the holder retains a list rather
+    /// than one table, and releases them independently.
+    #[test]
+    fn several_frozen_tables_are_held_and_released_independently() {
+        let active = active();
+        active.insert(&row(1, 10, 0)).unwrap();
+        let first = active.freeze().unwrap();
+        active.insert(&row(1, 20, 1)).unwrap();
+        let second = active.freeze().unwrap();
+
+        assert_eq!(active.frozen().len(), 2);
+        active.release(&first);
+        assert_eq!(active.frozen().len(), 1);
+        assert_eq!(active.held_rows(), 1);
+        active.release(&second);
+        assert!(active.frozen().is_empty());
+    }
+
+    /// Releasing something that was never frozen here, or twice, must be a
+    /// no-op: the flusher retries, and a retry must not corrupt the list.
+    #[test]
+    fn releasing_twice_is_harmless() {
+        let active = active();
+        active.insert(&row(1, 10, 0)).unwrap();
+        let frozen = active.freeze().unwrap();
+
+        active.release(&frozen);
+        active.release(&frozen);
+
+        assert!(active.frozen().is_empty());
     }
 
     /// §2: the frozen table carries what was written, and the writer keeps it

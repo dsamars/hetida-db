@@ -144,14 +144,35 @@ impl PartitionedTable {
             .map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Bytes the Arrow arrays of every partition hold.
+    /// Frozen tables of one partition, whose rows are not yet durable (§5).
     ///
-    /// Drives the size half of the flush trigger (§2) and the hard cap that
-    /// refuses ingestion (§7).
+    /// A reader must union these with the partition's active table, or a flush
+    /// in flight makes rows disappear from answers.
+    pub fn frozen(&self, start: Micros) -> Vec<Arc<MemTable>> {
+        self.partitions
+            .get(&start)
+            .map_or_else(Vec::new, |entry| entry.value().frozen())
+    }
+
+    /// Drops a frozen table of `start`, on the caller's word that it is durable.
+    ///
+    /// Only the flusher calls this, and only once the Parquet file is in place.
+    pub fn release(&self, start: Micros, table: &Arc<MemTable>) {
+        if let Some(partition) = self.partitions.get(&start) {
+            partition.value().release(table);
+        }
+    }
+
+    /// Bytes the Arrow arrays of every partition hold, frozen ones included.
+    ///
+    /// Drives the hard cap that refuses ingestion (§7). Frozen tables count
+    /// because they still occupy memory until their file is durable — a stalled
+    /// flush is exactly when the cap must bite. The *flush* trigger uses
+    /// [`Self::partition_bytes`] instead, which does not.
     pub fn memory_bytes(&self) -> usize {
         self.partitions
             .iter()
-            .map(|entry| entry.value().current().memory_bytes())
+            .map(|entry| entry.value().held_bytes())
             .sum()
     }
 
@@ -162,26 +183,33 @@ impl PartitionedTable {
             .and_then(|entry| entry.value().current().oldest_system_time())
     }
 
-    /// Bytes one partition holds (§2).
+    /// Bytes one partition's *active* table holds (§2).
+    ///
+    /// Deliberately not frozen ones: this drives the flush trigger, and counting
+    /// a flush already in flight would re-freeze the partition on every tick and
+    /// produce a stream of empty tables.
     pub fn partition_bytes(&self, start: Micros) -> usize {
         self.partitions
             .get(&start)
             .map_or(0, |entry| entry.value().current().memory_bytes())
     }
 
-    /// The lowest `seq` any partition still holds (§4).
+    /// The lowest `seq` any partition still holds, frozen tables included (§4).
+    ///
+    /// A `seq` in a frozen table is not yet durable anywhere, so a checkpoint
+    /// must stay below it.
     pub fn min_seq(&self) -> Option<Seq> {
         self.partitions
             .iter()
-            .filter_map(|entry| entry.value().current().min_seq())
+            .filter_map(|entry| entry.value().min_seq())
             .min()
     }
 
-    /// Rows currently held across every partition, counting every version.
+    /// Rows held across every partition, frozen tables included.
     pub fn num_rows(&self) -> usize {
         self.partitions
             .iter()
-            .map(|entry| entry.value().current().num_rows())
+            .map(|entry| entry.value().held_rows())
             .sum()
     }
 
@@ -461,6 +489,61 @@ mod tests {
     #[test]
     fn freezing_an_absent_partition_yields_nothing() {
         assert!(table().freeze(AUGUST).unwrap().is_none());
+    }
+
+    /// §5, §7: a frozen partition's rows stay visible and stay counted until
+    /// their file is durable. A reader consulting only the active tables would
+    /// answer without them, and the memory cap would think they had gone.
+    #[test]
+    fn a_frozen_partition_is_still_held_until_released() {
+        let table = table();
+        table.insert(&stamped(&[(1, AUGUST, 0, 1.0)], 100)).unwrap();
+        let august = PartitionInterval::Month.start(AUGUST).unwrap();
+        let bytes = table.memory_bytes();
+
+        let frozen = table.freeze(august).unwrap().expect("august");
+
+        assert_eq!(table.num_rows(), 1, "the row must still be reachable");
+        assert_eq!(table.memory_bytes(), bytes, "and still counted (§7)");
+        assert_eq!(table.frozen(august).len(), 1);
+
+        table.release(august, &frozen);
+        assert_eq!(table.num_rows(), 0);
+        assert_eq!(table.memory_bytes(), 0);
+    }
+
+    /// §2: the flush trigger measures the *active* table only. Counting a
+    /// frozen one would re-freeze the partition on every tick while its write
+    /// is in flight, producing a stream of empty tables.
+    #[test]
+    fn the_flush_trigger_ignores_a_flush_already_in_flight() {
+        let table = table();
+        table.insert(&stamped(&[(1, AUGUST, 0, 1.0)], 100)).unwrap();
+        let august = PartitionInterval::Month.start(AUGUST).unwrap();
+
+        table.freeze(august).unwrap().expect("august");
+
+        assert_eq!(
+            table.partition_bytes(august),
+            0,
+            "the partition has nothing new to flush"
+        );
+        assert!(table.memory_bytes() > 0, "but it is still holding memory");
+    }
+
+    /// §4: the checkpoint watermark reads this, and a `seq` in a frozen table
+    /// is not yet durable anywhere.
+    #[test]
+    fn the_lowest_seq_includes_a_partition_being_flushed() {
+        let table = table();
+        table.insert(&stamped(&[(1, AUGUST, 5, 1.0)], 100)).unwrap();
+        let august = PartitionInterval::Month.start(AUGUST).unwrap();
+        let frozen = table.freeze(august).unwrap().unwrap();
+        table.insert(&stamped(&[(1, AUGUST, 9, 2.0)], 100)).unwrap();
+
+        assert_eq!(table.min_seq(), Some(5));
+        table.release(august, &frozen);
+        assert_eq!(table.min_seq(), Some(9));
     }
 
     /// §1: versions of one logical row stay in one partition and stay ordered.

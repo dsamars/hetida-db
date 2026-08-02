@@ -31,6 +31,10 @@ bytes = "1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 crc32fast = "1.5.0"
 dashmap = "6.2.1"
+# The query engine (§5). This is the crate the Arrow version is derived from,
+# not the other way round: 54.1 resolves arrow 58.4, which is why every Arrow
+# crate above is pinned there. Bumping this line means bumping all of them.
+datafusion = "54.1"
 # Stream combinators for the do_put/do_get streams; arrow-flight speaks in
 # `futures::Stream`, so this is its vocabulary rather than an extra choice.
 futures = "0.3"

@@ -187,12 +187,19 @@ impl Flusher {
             return Ok(None);
         };
 
-        Ok(Some(write_partition(
+        let written = write_partition(
             self.storage.as_ref(),
             &self.partition_dir(start)?,
             &batch,
             self.parquet,
-        )?))
+        )?;
+
+        // Only now, with the file renamed into place, may the rows leave memory.
+        // Releasing earlier — or on the error path above — would lose them: a
+        // frozen table is the only copy outside the log until its file exists.
+        state.release(start, &frozen);
+
+        Ok(Some(written))
     }
 
     /// The highest `seq` a checkpoint may safely claim is in Parquet (§4).
@@ -744,9 +751,68 @@ mod tests {
             }
         );
         assert_eq!(scheduler.failed(), 1, "the failure must be visible");
-        // The freeze already happened, so the rows are in the retired table the
-        // write failed on. What matters is that the failure is not silent.
-        assert!(scheduler.flushed() == 0);
+        assert_eq!(scheduler.flushed(), 0);
+        // The freeze already happened, but the retired table is still held — so
+        // the rows are neither lost nor invisible, and the §7 cap still sees the
+        // memory they occupy. Handing the only reference to the writer used to
+        // drop them on exactly this path.
+        assert_eq!(state.num_rows(), 1, "a failed write must not lose the rows");
+        assert!(state.memory_bytes() > 0, "and the cap must still see them");
+    }
+
+    /// §2, §5: the window a query must not fall into. Between the freeze and
+    /// the file being renamed into place the rows are in neither the active
+    /// table nor on disk, so the partition holds them — and holds them itself,
+    /// not through the caller's reference.
+    #[test]
+    fn a_frozen_partition_stays_visible_before_its_file_exists() {
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 0)], 100)).unwrap();
+        let start = august();
+
+        let frozen = state.freeze(start).unwrap().expect("august");
+        assert_eq!(state.num_rows(), 1, "the rows must stay readable");
+
+        drop(frozen);
+        assert_eq!(
+            state.num_rows(),
+            1,
+            "holding them must not depend on the flusher's own reference"
+        );
+        assert_eq!(state.frozen(start).len(), 1);
+    }
+
+    /// And they leave exactly when their file is in place, not before.
+    #[test]
+    fn a_successful_flush_releases_the_rows_it_wrote() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 0)], 100)).unwrap();
+
+        flusher(&storage)
+            .flush(&state, august())
+            .expect("flush")
+            .expect("a file");
+
+        assert_eq!(state.num_rows(), 0, "written rows leave memory");
+        assert!(state.frozen(august()).is_empty());
+    }
+
+    /// §4: a checkpoint may not pass a `seq` that only a frozen table holds —
+    /// the segment covering it would be reclaimed while the rows are nowhere
+    /// durable.
+    #[test]
+    fn the_checkpoint_stops_below_a_seq_still_being_flushed() {
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 5)], 100)).unwrap();
+
+        let _frozen = state.freeze(august()).unwrap().expect("august");
+
+        assert_eq!(
+            Flusher::checkpoint_watermark(&state, Some(99)),
+            Some(4),
+            "seq 5 is in a frozen table, so nothing at or above it is durable"
+        );
     }
 
     /// One partition's failure must not stop the others from being written.
