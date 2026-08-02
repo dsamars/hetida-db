@@ -21,17 +21,19 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use futures::Stream;
 use futures::stream::{self, BoxStream};
+use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::archive::Archive;
+use crate::archive::{Archive, IngestError};
 use crate::proto::{RegisterRequest, RegisterResponse};
 use crate::registry::SeriesKey;
 
@@ -95,6 +97,38 @@ impl HetidaFlightService {
         }
 
         Ok(RegisterResponse { metric_ids })
+    }
+}
+
+/// The table a descriptor path names (§5).
+///
+/// Exactly one path element: a table name, not a hierarchy. Accepting a longer
+/// path would leave it ambiguous which element the table is.
+fn table_from(path: &[String]) -> Result<&str, Status> {
+    match path {
+        [table] if !table.is_empty() => Ok(table),
+        [] => Err(Status::invalid_argument(
+            "do_put needs a table in FlightDescriptor::path (§5)",
+        )),
+        _ => Err(Status::invalid_argument(format!(
+            "expected one path element naming a table, got {}",
+            path.len()
+        ))),
+    }
+}
+
+/// Maps an ingest failure onto the status a client should see.
+///
+/// The distinction matters: `RESOURCE_EXHAUSTED` tells a client to back off and
+/// retry (§7), where `INVALID_ARGUMENT` tells it the batch will never be
+/// accepted and retrying is pointless.
+fn ingest_status(error: IngestError) -> Status {
+    match error {
+        IngestError::Exhausted { .. } => Status::resource_exhausted(error.to_string()),
+        IngestError::Catalogue(_) => Status::invalid_argument(error.to_string()),
+        IngestError::Stamp(_) | IngestError::Wal(_) | IngestError::Table(_) => {
+            Status::internal(error.to_string())
+        }
     }
 }
 
@@ -202,11 +236,60 @@ impl FlightService for HetidaFlightService {
         ))
     }
 
+    /// Ingests a stream of `RecordBatch` into the table the descriptor names
+    /// (§4, §5).
+    ///
+    /// One acknowledgement per batch, sent only after the fsync its record was
+    /// part of returned — *acked* means *durable* (§4). The stream carries many
+    /// batches behind a single call, which is why authorization belongs on the
+    /// call and not on the message (§9).
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put is the next endpoint (§5)"))
+        let archive = Arc::clone(&self.archive);
+        let mut incoming = request.into_inner().peekable();
+
+        // The descriptor rides on the first message, so it is read before the
+        // stream is handed to the decoder (§5).
+        let path = match Pin::new(&mut incoming).peek().await {
+            Some(Ok(first)) => first
+                .flight_descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.path.clone())
+                .unwrap_or_default(),
+            Some(Err(status)) => return Err(status.clone()),
+            None => return Err(Status::invalid_argument("do_put received no data")),
+        };
+        let table = table_from(&path)?.to_owned();
+
+        let mut batches =
+            FlightRecordBatchStream::new_from_flight_data(incoming.map_err(FlightError::from));
+
+        // Acknowledgements are produced lazily, one per batch, as each is made
+        // durable. Collecting them first would read the whole stream into memory
+        // before answering anything — which is precisely the unbounded buffering
+        // §7 forbids. Because the stream is only polled as the client reads
+        // acknowledgements, gRPC flow control carries the pressure back to it
+        // without a protocol extension.
+        Ok(Response::new(Box::pin(stream::poll_fn(move |context| {
+            batches.poll_next_unpin(context).map(|batch| {
+                batch.map(|batch| {
+                    let batch = batch.map_err(|error| {
+                        Status::invalid_argument(format!("malformed flight data: {error}"))
+                    })?;
+                    let outcome = archive.ingest(&table, &batch).map_err(ingest_status)?;
+                    Ok(PutResult {
+                        app_metadata: format!(
+                            "{{\"inserted\":{},\"suppressed\":{}}}",
+                            outcome.inserted, outcome.suppressed
+                        )
+                        .into_bytes()
+                        .into(),
+                    })
+                })
+            })
+        }))))
     }
 
     async fn do_exchange(
@@ -233,7 +316,10 @@ mod tests {
 
     use crate::archive::{Archive, ArchiveConfig};
     use crate::clock::TestClock;
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use crate::proto::SeriesKey as ProtoKey;
+    use crate::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, timestamp_type};
     use crate::storage::InMemoryStorage;
     use crate::wal::WalConfig;
 
@@ -257,7 +343,13 @@ mod tests {
             )
             .expect("archive"),
         );
+        serve_archive(archive).await
+    }
 
+    /// Serves an archive the caller built, for tests that need a specific config.
+    async fn serve_archive(
+        archive: Arc<Archive>,
+    ) -> (FlightServiceClient<tonic::transport::Channel>, Arc<Archive>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let service = HetidaFlightService::new(Arc::clone(&archive));
@@ -285,6 +377,64 @@ mod tests {
         };
 
         (client, archive)
+    }
+
+    /// A client batch: identity columns plus a value, no system columns.
+    fn client_batch(rows: &[(u64, i64, f64)]) -> arrow::array::RecordBatch {
+        use arrow::array::{Float64Array, TimestampMicrosecondArray, UInt64Array};
+        arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(TIMESTAMP_COLUMN, timestamp_type(), false),
+                Field::new(METRIC_ID_COLUMN, DataType::UInt64, false),
+                Field::new("value", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|(_, ts, _)| *ts).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, _, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("client batch")
+    }
+
+    /// Encodes batches as Flight data without a descriptor.
+    fn encode_without_descriptor(batch: &arrow::array::RecordBatch) -> (Vec<FlightData>, ()) {
+        let encoded: Vec<FlightData> = futures::executor::block_on(async {
+            arrow_flight::encode::FlightDataEncoderBuilder::new()
+                .build(stream::iter(vec![Ok(batch.clone())]))
+                .try_collect()
+                .await
+                .expect("encode")
+        });
+        (encoded, ())
+    }
+
+    /// Writes `batches` into `table` and returns how many acknowledgements came
+    /// back.
+    async fn write(
+        client: &mut FlightServiceClient<tonic::transport::Channel>,
+        table: &str,
+        batches: Vec<arrow::array::RecordBatch>,
+    ) -> Result<usize, Status> {
+        let encoded: Vec<FlightData> = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![table.to_owned()])))
+            .build(stream::iter(batches.into_iter().map(Ok)))
+            .try_collect()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        let mut acks = client.do_put(stream::iter(encoded)).await?.into_inner();
+        let mut count = 0;
+        while futures::TryStreamExt::try_next(&mut acks).await?.is_some() {
+            count += 1;
+        }
+        Ok(count)
     }
 
     fn key(name: &str, labels: &[(&str, &str)]) -> ProtoKey {
@@ -539,6 +689,176 @@ mod tests {
 
         assert_eq!(first.r#type, REGISTER_ACTION);
         assert!(!first.description.is_empty());
+    }
+
+    /// §4, §5: the round trip — a client writes batches and gets one
+    /// acknowledgement per batch, and the rows are then in the archive.
+    #[tokio::test]
+    async fn writing_over_flight_ingests_and_acknowledges() {
+        let (mut client, archive) = serve().await;
+        let ids = register(&mut client, vec![key("temp", &[])]).await.unwrap();
+
+        let acks = write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(ids[0], 1_000, 1.5)])],
+        )
+        .await
+        .expect("do_put");
+
+        assert_eq!(acks, 1, "one acknowledgement per batch (§4)");
+        assert_eq!(archive.table("readings").expect("readings").num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn several_batches_in_one_stream_are_all_acknowledged() {
+        let (mut client, archive) = serve().await;
+        let ids = register(&mut client, vec![key("temp", &[])]).await.unwrap();
+
+        let acks = write(
+            &mut client,
+            "readings",
+            (0..4)
+                .map(|row| client_batch(&[(ids[0], 1_000 + row * 1_000, row as f64)]))
+                .collect(),
+        )
+        .await
+        .expect("do_put");
+
+        assert_eq!(acks, 4);
+        assert_eq!(archive.table("readings").unwrap().num_rows(), 4);
+    }
+
+    /// §4: acked means durable. What a client was told survived is in the log, so
+    /// reopening the archive over the same store finds it.
+    #[tokio::test]
+    async fn acknowledged_rows_are_durable() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let config = ArchiveConfig {
+            wal: WalConfig {
+                segment_bytes: 64 * 1024,
+                max_commit_delay: Duration::ZERO,
+            },
+            ..ArchiveConfig::default()
+        };
+
+        {
+            let archive = Arc::new(
+                Archive::open(
+                    Arc::clone(&storage) as Arc<_>,
+                    &config,
+                    Arc::new(TestClock::new(1_000)),
+                )
+                .unwrap(),
+            );
+            archive
+                .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+                .expect("ingest");
+        }
+
+        let reopened = Archive::open(
+            Arc::clone(&storage) as Arc<_>,
+            &config,
+            Arc::new(TestClock::new(2_000)),
+        )
+        .unwrap();
+
+        assert_eq!(reopened.recovered().data_records, 1);
+        assert_eq!(reopened.table("readings").unwrap().num_rows(), 1);
+    }
+
+    /// §5: the table comes from the descriptor path. Without one the server
+    /// cannot know where to write, and guessing would be worse than refusing.
+    #[tokio::test]
+    async fn a_stream_without_a_table_is_refused() {
+        let (mut client, _archive) = serve().await;
+        let batch = client_batch(&[(1, 1_000, 1.5)]);
+
+        // A stream carrying data but no descriptor.
+        let (encoded, _) = encode_without_descriptor(&batch);
+        let status = client
+            .do_put(stream::iter(encoded))
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// §6: a type change is refused as INVALID_ARGUMENT — retrying will never
+    /// help, and the client needs to know that rather than backing off.
+    #[tokio::test]
+    async fn a_conflicting_type_is_invalid_argument() {
+        let (mut client, _archive) = serve().await;
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 1_000, 1.5)])],
+        )
+        .await
+        .unwrap();
+
+        let conflicting = arrow::array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(TIMESTAMP_COLUMN, timestamp_type(), false),
+                Field::new(METRIC_ID_COLUMN, DataType::UInt64, false),
+                Field::new("value", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000i64,
+                ])),
+                Arc::new(arrow::array::UInt64Array::from(vec![1u64])),
+                Arc::new(arrow::array::Int64Array::from(vec![5i64])),
+            ],
+        )
+        .unwrap();
+
+        let status = write(&mut client, "readings", vec![conflicting])
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// §7: past the memory cap a client gets RESOURCE_EXHAUSTED — a cause it can
+    /// back off on, rather than a timeout with no explanation.
+    #[tokio::test]
+    async fn past_the_memory_cap_the_client_gets_resource_exhausted() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let archive = Arc::new(
+            Archive::open(
+                storage,
+                &ArchiveConfig {
+                    max_memtable_bytes: 1,
+                    wal: WalConfig {
+                        segment_bytes: 64 * 1024,
+                        max_commit_delay: Duration::ZERO,
+                    },
+                    ..ArchiveConfig::default()
+                },
+                Arc::new(TestClock::new(1_000)),
+            )
+            .unwrap(),
+        );
+        let (mut client, _) = serve_archive(Arc::clone(&archive)).await;
+
+        // The first write fills the memtable; the second meets the cap.
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 1_000, 1.5)])],
+        )
+        .await
+        .expect("first write");
+        let status = write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(2, 2_000, 2.5)])],
+        )
+        .await
+        .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     /// §5: an endpoint that does not exist yet must say so, not drop the

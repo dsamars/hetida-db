@@ -143,6 +143,17 @@ impl PartitionedTable {
             .map(|entry| Arc::clone(entry.value()))
     }
 
+    /// Bytes the Arrow arrays of every partition hold.
+    ///
+    /// Drives the size half of the flush trigger (§2) and the hard cap that
+    /// refuses ingestion (§7).
+    pub fn memory_bytes(&self) -> usize {
+        self.partitions
+            .iter()
+            .map(|entry| entry.value().current().memory_bytes())
+            .sum()
+    }
+
     /// Rows currently held across every partition, counting every version.
     pub fn num_rows(&self) -> usize {
         self.partitions

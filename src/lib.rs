@@ -23,7 +23,8 @@
 //! [`active`]) and its suppression state ([`suppression`]), the write-ahead log
 //! ([`wal`]), the partition layout ([`partition`]), the routing that places a
 //! batch in it ([`table`]), the startup sequence that assembles all of it
-//! ([`archive`]) and the Flight surface serving it ([`flight`]).
+//! ([`archive`]) and the Flight surface serving it ([`flight`]), with batches
+//! made durable through the data log ([`data_log`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -43,6 +44,7 @@ pub mod archive;
 pub mod catalog;
 pub mod catalog_log;
 pub mod clock;
+pub mod data_log;
 pub mod flight;
 pub mod instance;
 pub mod memtable;

@@ -28,17 +28,52 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
+
 use crate::catalog::{CatalogueError, TableCatalogue, TableConfig};
 use crate::catalog_log::{CATALOG_LOG_DIR, DATA_LOG_DIR, WalCatalogLog, replay_catalog};
 use crate::clock::Clock;
+use crate::data_log::{encode_batch, replay_data};
 use crate::instance::{InstanceError, InstanceMetadata};
+use crate::memtable::{InsertOutcome, MemTableError};
 use crate::partition::PartitionInterval;
 use crate::registry::{MetricRegistry, RegistryError};
+use crate::schema::SEQ_COLUMN;
 use crate::seq::{AtomicSequence, Seq, SequenceSource};
+use crate::stamp::StampError;
 use crate::stamp::Stamper;
 use crate::storage::Storage;
 use crate::table::PartitionedTable;
-use crate::wal::{Wal, WalConfig, WalError, replay};
+use crate::table::TableError;
+use crate::wal::{RecordKind, Wal, WalConfig, WalError, replay};
+
+/// Why an ingest was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum IngestError {
+    /// The batch's schema is not compatible with the table's (§6).
+    #[error(transparent)]
+    Catalogue(#[from] CatalogueError),
+    /// The batch could not be stamped with its system columns (§1).
+    #[error(transparent)]
+    Stamp(#[from] StampError),
+    /// The batch could not be made durable, so it was not acknowledged (§4).
+    #[error(transparent)]
+    Wal(#[from] WalError),
+    /// The batch could not be routed or admitted (§3).
+    #[error(transparent)]
+    Table(#[from] TableError),
+    /// The memtables are at their cap and flushing is behind (§7).
+    #[error(
+        "memtables hold {held} bytes of a {cap} byte cap; \
+         retry once the archive has flushed"
+    )]
+    Exhausted {
+        /// Bytes currently held.
+        held: usize,
+        /// The configured cap.
+        cap: usize,
+    },
+}
 
 /// Why an archive could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -55,13 +90,16 @@ pub enum ArchiveError {
     /// A recovered schema could not be restored.
     #[error(transparent)]
     Catalogue(#[from] CatalogueError),
+    /// A replayed batch could not be routed back into memory.
+    #[error(transparent)]
+    Table(#[from] TableError),
 }
 
 /// How an archive is configured at startup.
 ///
 /// Everything here is an operator's choice, re-read at every start. Nothing in it
 /// is recovered from disk — what *is* recovered validates against it (§11).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArchiveConfig {
     /// Layout granularity, validated against the instance metadata (§11).
     pub partition_interval: PartitionInterval,
@@ -71,6 +109,26 @@ pub struct ArchiveConfig {
     pub default_table: TableConfig,
     /// Per-table configuration (§6): suppression reach, later retention.
     pub tables: Vec<(String, TableConfig)>,
+    /// Hard cap on bytes the memtables may hold before ingestion is refused (§7).
+    ///
+    /// Past this an insert answers `RESOURCE_EXHAUSTED` rather than buffering
+    /// without bound or blocking indefinitely — a client then sees a cause
+    /// instead of a timeout.
+    pub max_memtable_bytes: usize,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            partition_interval: PartitionInterval::default(),
+            wal: WalConfig::default(),
+            default_table: TableConfig::default(),
+            tables: Vec::new(),
+            // A gigabyte: large enough that a healthy instance never meets it,
+            // small enough that an overloaded one refuses before the host does.
+            max_memtable_bytes: 1024 * 1024 * 1024,
+        }
+    }
 }
 
 /// What a startup recovered, for the operator to see.
@@ -82,10 +140,7 @@ pub struct Recovered {
     pub schemas: usize,
     /// Catalogue records skipped as undecodable (§4).
     pub undecodable: usize,
-    /// Data records the data log still holds.
-    ///
-    /// Counted but not yet applied: reading them back into memtables needs the
-    /// batch encoding that arrives with `do_put`.
+    /// Batches replayed from the data log into memtables.
     pub data_records: usize,
     /// Whether a log's tail was discarded as torn (§4).
     pub truncated: bool,
@@ -102,6 +157,7 @@ pub struct Archive {
     stamper: Arc<Stamper>,
     tables: dashmap::DashMap<String, Arc<PartitionedTable>>,
     data_log: Arc<Wal>,
+    max_memtable_bytes: usize,
     recovered: Recovered,
 }
 
@@ -160,20 +216,94 @@ impl Archive {
             registrations: recovered_catalogue.registrations.len(),
             schemas: recovered_catalogue.schemas.len(),
             undecodable: recovered_catalogue.undecodable,
-            data_records: data.records.len(),
+            data_records: 0,
             truncated: recovered_catalogue.truncated.is_some() || data.truncated.is_some(),
             resumed_at: resume_at,
         };
 
-        Ok(Self {
+        let archive = Self {
             interval,
             registry,
             catalogue,
             stamper: Arc::new(Stamper::new(clock, sequence)),
             tables: dashmap::DashMap::new(),
             data_log,
+            max_memtable_bytes: config.max_memtable_bytes,
             recovered,
-        })
+        };
+
+        // 4. The data log last, into the memtables the catalogue now describes.
+        //    Batches replay stamped, so recovery reproduces the versions the
+        //    original run created rather than issuing new ones (§1).
+        let replayed_data = replay_data(storage.as_ref(), Path::new(DATA_LOG_DIR))?;
+        let mut applied = 0;
+        for record in &replayed_data.records {
+            if let Some(state) = archive.table(&record.table) {
+                state.insert(&record.batch)?;
+                applied += 1;
+            }
+            // A batch whose table the catalogue does not know is damage: the
+            // schema record that would describe it is missing. Counted below
+            // rather than fatal, since §4 forbids failing a start.
+        }
+
+        let mut archive = archive;
+        archive.recovered.data_records = applied;
+        archive.recovered.undecodable +=
+            replayed_data.undecodable + replayed_data.records.len().saturating_sub(applied);
+        archive.recovered.truncated |= replayed_data.truncated;
+
+        Ok(archive)
+    }
+
+    /// Admits one client batch into `table` (§1, §3, §4, §6).
+    ///
+    /// The order is the contract. The schema is admitted first, so a rejected
+    /// batch never reaches the log. Then the batch is stamped, then made durable,
+    /// and only then routed into memory — because §4 requires that an
+    /// acknowledgement means the rows survive a crash, and a caller learns the
+    /// outcome only after the fsync its record was part of returned.
+    ///
+    /// Refuses with [`IngestError::Exhausted`] past the memory cap rather than
+    /// buffering without bound (§7).
+    pub fn ingest(&self, table: &str, batch: &RecordBatch) -> Result<InsertOutcome, IngestError> {
+        // §7: check before doing any work, so an overloaded instance spends
+        // nothing on a batch it is about to refuse.
+        let held = self.memtable_bytes();
+        if held >= self.max_memtable_bytes {
+            return Err(IngestError::Exhausted {
+                held,
+                cap: self.max_memtable_bytes,
+            });
+        }
+
+        // §6: evolution and rejection happen before anything is logged.
+        self.catalogue.accept(table, batch.schema().as_ref())?;
+        let stamped = self.stamper.stamp(batch)?;
+
+        // §4: durable before acknowledged, and before it is visible in memory —
+        // a row in a memtable that no log holds would vanish on a crash.
+        let seq = first_seq(&stamped);
+        self.data_log.append(
+            RecordKind::Data,
+            seq,
+            encode_batch(table, &stamped).map_err(IngestError::Catalogue)?,
+        )?;
+
+        let state = self.table(table).ok_or_else(|| {
+            IngestError::Table(TableError::MemTable(MemTableError::WrongColumnType(
+                table.to_owned(),
+            )))
+        })?;
+        Ok(state.insert(&stamped)?)
+    }
+
+    /// Bytes the memtables of every table currently hold (§7).
+    pub fn memtable_bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .map(|entry| entry.value().memory_bytes())
+            .sum()
     }
 
     /// What this startup recovered.
@@ -228,6 +358,15 @@ impl Archive {
                 .value(),
         ))
     }
+}
+
+/// The first `seq` a stamped batch carries, which numbers its log record.
+fn first_seq(stamped: &RecordBatch) -> Seq {
+    stamped
+        .column_by_name(SEQ_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<arrow::array::UInt64Array>())
+        .and_then(|seqs| seqs.values().first().copied())
+        .unwrap_or_default()
 }
 
 /// The highest `seq` any record in the log under `dir` holds.
@@ -478,6 +617,222 @@ mod tests {
             &archive.table("readings").unwrap(),
             &archive.table("readings").unwrap()
         ));
+    }
+
+    fn client_batch(rows: &[(u64, Micros, f64)]) -> arrow::array::RecordBatch {
+        use arrow::array::{Float64Array, TimestampMicrosecondArray, UInt64Array};
+        arrow::array::RecordBatch::try_new(
+            Arc::new(client_schema()),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(
+                    rows.iter().map(|(_, ts, _)| *ts).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt64Array::from(
+                    rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|(_, _, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// §1, §4, §6: the whole ingest in one call — schema admitted, stamped, made
+    /// durable, then routed.
+    #[test]
+    fn ingest_admits_stamps_and_routes_a_batch() {
+        let storage = InMemoryStorage::new();
+        let archive = open(&storage, &config()).unwrap();
+
+        let outcome = archive
+            .ingest(
+                "readings",
+                &client_batch(&[(1, 1_000, 1.5), (2, 2_000, 2.5)]),
+            )
+            .expect("ingest");
+
+        assert_eq!(outcome.inserted, 2);
+        assert!(archive.catalogue().schema("readings").is_some());
+        assert_eq!(archive.table("readings").unwrap().num_rows(), 2);
+    }
+
+    /// §6: a rejected schema must never reach the log — otherwise a replay would
+    /// admit what the live path refused.
+    #[test]
+    fn a_rejected_schema_is_not_logged() {
+        let storage = InMemoryStorage::new();
+        let archive = open(&storage, &config()).unwrap();
+        archive
+            .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+            .unwrap();
+
+        let conflicting = Schema::new(vec![
+            Field::new(TIMESTAMP_COLUMN, timestamp_type(), false),
+            Field::new(METRIC_ID_COLUMN, DataType::UInt64, false),
+            Field::new("value", DataType::Int64, true),
+        ]);
+        let batch = arrow::array::RecordBatch::try_new(
+            Arc::new(conflicting),
+            vec![
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000i64,
+                ])),
+                Arc::new(arrow::array::UInt64Array::from(vec![1u64])),
+                Arc::new(arrow::array::Int64Array::from(vec![5i64])),
+            ],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            archive.ingest("readings", &batch),
+            Err(IngestError::Catalogue(_))
+        ));
+
+        // The reopened archive must hold only the accepted batch.
+        let reopened = open(&storage, &config()).unwrap();
+        assert_eq!(reopened.recovered().data_records, 1);
+    }
+
+    /// §4: an acknowledged batch survives a crash, and replay reproduces the
+    /// versions the original run created rather than issuing new ones.
+    #[test]
+    fn ingested_batches_replay_into_memory_after_a_restart() {
+        let storage = InMemoryStorage::new();
+        {
+            let archive = open(&storage, &config()).unwrap();
+            archive
+                .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+                .unwrap();
+            archive
+                .ingest("readings", &client_batch(&[(2, 2_000, 2.5)]))
+                .unwrap();
+        }
+
+        let archive = open(&storage, &config()).unwrap();
+
+        assert_eq!(archive.recovered().data_records, 2);
+        assert_eq!(
+            archive.table("readings").expect("readings").num_rows(),
+            2,
+            "acknowledged rows must be back in memory"
+        );
+        assert_eq!(archive.recovered().undecodable, 0);
+    }
+
+    /// §1: a replayed batch keeps its `seq`, so a repeat after a restart is still
+    /// recognised as unchanged rather than becoming a new version.
+    #[test]
+    fn suppression_still_works_against_replayed_rows() {
+        let storage = InMemoryStorage::new();
+        {
+            let archive = open(&storage, &config()).unwrap();
+            archive
+                .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+                .unwrap();
+        }
+
+        let archive = open(&storage, &config()).unwrap();
+        let outcome = archive
+            .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+            .expect("ingest");
+
+        assert_eq!(
+            outcome.suppressed, 1,
+            "a repeat of a replayed row must not manufacture a version"
+        );
+    }
+
+    /// §7: past the cap ingestion is refused with a cause, rather than buffering
+    /// without bound or blocking until the client times out.
+    #[test]
+    fn ingestion_past_the_memory_cap_is_refused() {
+        let storage = InMemoryStorage::new();
+        let archive = open(
+            &storage,
+            &ArchiveConfig {
+                max_memtable_bytes: 1,
+                ..config()
+            },
+        )
+        .unwrap();
+
+        // The first batch is admitted: the cap is checked against what is held,
+        // and nothing is held yet.
+        archive
+            .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+            .unwrap();
+
+        let error = archive
+            .ingest("readings", &client_batch(&[(2, 2_000, 2.5)]))
+            .expect_err("must be refused");
+
+        assert!(matches!(error, IngestError::Exhausted { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains('1'),
+            "the cause must name the cap: {message}"
+        );
+    }
+
+    /// §7: a refusal must leave nothing behind — no log record, no rows.
+    #[test]
+    fn a_refused_batch_is_not_logged() {
+        let storage = InMemoryStorage::new();
+        {
+            let archive = open(
+                &storage,
+                &ArchiveConfig {
+                    max_memtable_bytes: 1,
+                    ..config()
+                },
+            )
+            .unwrap();
+            archive
+                .ingest("readings", &client_batch(&[(1, 1_000, 1.5)]))
+                .unwrap();
+            assert!(
+                archive
+                    .ingest("readings", &client_batch(&[(2, 2_000, 2.5)]))
+                    .is_err()
+            );
+        }
+
+        let reopened = open(&storage, &config()).unwrap();
+        assert_eq!(
+            reopened.recovered().data_records,
+            1,
+            "the refused batch must not be in the log"
+        );
+    }
+
+    /// §3, §11: one call may span partitions, and the routing survives a restart.
+    #[test]
+    fn a_batch_spanning_partitions_replays_into_both() {
+        const SEPTEMBER: Micros = 1_788_220_800_000_000;
+        const AUGUST: Micros = 1_785_681_432_000_000;
+
+        let storage = InMemoryStorage::new();
+        {
+            let archive = open(&storage, &config()).unwrap();
+            archive
+                .ingest(
+                    "readings",
+                    &client_batch(&[(1, AUGUST, 1.5), (1, SEPTEMBER, 2.5)]),
+                )
+                .unwrap();
+            assert_eq!(
+                archive.table("readings").unwrap().partition_starts().len(),
+                2
+            );
+        }
+
+        let archive = open(&storage, &config()).unwrap();
+        assert_eq!(
+            archive.table("readings").unwrap().partition_starts().len(),
+            2,
+            "both partitions must come back"
+        );
     }
 
     /// §4: a torn tail must not prevent a start, and it must be reported.

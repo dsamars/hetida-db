@@ -28,8 +28,8 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Implement freeze-and-swap so a flush never blocks ingestion: freeze the active `MemTable`, open a new one, hand the frozen one to the background writer (§2).
 - [x] Build append-only WAL with group commit (shared fsync, configurable max delay), per-record CRC, segment rotation, and checkpoint records for segment reclamation (§4).
 - [x] Implement WAL replay: apply segments in sequence order, truncate at the first torn record, never fail startup on a damaged tail (§4).
-- [ ] Implement Arrow Flight `do_put` streaming endpoint ingesting `RecordBatch` payload directly: assign sequence numbers, resolve the target table from `FlightDescriptor::path`, acknowledge only after fsync (§4, §5).
-- [ ] Implement backpressure: bounded queues with gRPC flow control, plus `RESOURCE_EXHAUSTED` past the hard `MemTable` memory cap (§7).
+- [x] Implement Arrow Flight `do_put` streaming endpoint ingesting `RecordBatch` payload directly: assign sequence numbers, resolve the target table from `FlightDescriptor::path`, acknowledge only after fsync (§4, §5). *Batch replay into memtables lands with it, closing the startup gap.*
+- [x] Implement backpressure: acknowledgements produced lazily so gRPC flow control carries the pressure back, plus `RESOURCE_EXHAUSTED` past the hard `MemTable` memory cap (§7).
 
 ## Phase 2: Parquet Storage & Archiver
 - [ ] Implement Parquet writer with ZSTD compression and explicit Min/Max column index generation, including `system_time` so old observation points can skip whole row groups (§1).
