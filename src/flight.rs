@@ -119,13 +119,22 @@ fn table_from(path: &[String]) -> Result<&str, Status> {
 
 /// Maps an ingest failure onto the status a client should see.
 ///
-/// The distinction matters: `RESOURCE_EXHAUSTED` tells a client to back off and
-/// retry (§7), where `INVALID_ARGUMENT` tells it the batch will never be
-/// accepted and retrying is pointless.
+/// The distinctions matter, because each tells the client to do something
+/// different:
+///
+/// - `RESOURCE_EXHAUSTED` — back off and retry the same batch (§7).
+/// - `INVALID_ARGUMENT` — the batch is wrong in itself and will never be
+///   accepted, whatever the server's state (§6).
+/// - `FAILED_PRECONDITION` — the batch is well formed but has fallen behind the
+///   retention cutoff (§8). Backing off makes it worse: the cutoff only moves
+///   further forward, so this is a retry the client must not make.
 fn ingest_status(error: IngestError) -> Status {
     match error {
         IngestError::Exhausted { .. } => Status::resource_exhausted(error.to_string()),
-        IngestError::Catalogue(_) => Status::invalid_argument(error.to_string()),
+        IngestError::Catalogue(_) | IngestError::Partition(_) => {
+            Status::invalid_argument(error.to_string())
+        }
+        IngestError::Expired { .. } => Status::failed_precondition(error.to_string()),
         IngestError::Stamp(_) | IngestError::Wal(_) | IngestError::Table(_) => {
             Status::internal(error.to_string())
         }
@@ -865,6 +874,65 @@ mod tests {
         .expect_err("must be refused");
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    /// §8: data already outside the retention window is refused with an
+    /// explicit Flight error, not written and reaped moments later.
+    /// `FAILED_PRECONDITION` rather than `RESOURCE_EXHAUSTED`: backing off makes
+    /// it worse, because the cutoff only moves further forward.
+    #[tokio::test]
+    async fn expired_data_is_refused_with_an_explicit_error() {
+        const AUGUST: i64 = 1_785_681_432_000_000;
+        const JUNE: i64 = 1_781_481_600_000_000;
+        const DAY: i64 = 86_400_000_000;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let archive = Arc::new(
+            Archive::open(
+                storage,
+                &ArchiveConfig {
+                    tables: vec![(
+                        "readings".to_owned(),
+                        crate::catalog::TableConfig {
+                            retention: Some(30 * DAY),
+                            ..crate::catalog::TableConfig::default()
+                        },
+                    )],
+                    wal: WalConfig {
+                        segment_bytes: 64 * 1024,
+                        max_commit_delay: Duration::ZERO,
+                    },
+                    ..ArchiveConfig::default()
+                },
+                Arc::new(TestClock::new(AUGUST)),
+            )
+            .unwrap(),
+        );
+        let (mut client, _) = serve_archive(Arc::clone(&archive)).await;
+
+        // A live partition is accepted.
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, AUGUST, 1.5)])],
+        )
+        .await
+        .expect("august is live");
+
+        let status = write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, JUNE, 2.5)])],
+        )
+        .await
+        .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("retention"),
+            "the client must be told why: {}",
+            status.message()
+        );
     }
 
     /// §5: an endpoint that does not exist yet must say so, not drop the

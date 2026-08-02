@@ -16,11 +16,12 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use tonic::transport::Server;
 
 use hetida_db::archive::{Archive, ArchiveConfig};
-use hetida_db::clock::SystemClock;
+use hetida_db::clock::{Clock, SystemClock};
 use hetida_db::compact::{CompactConfig, Compactor, partition_dirs};
 use hetida_db::flight::HetidaFlightService;
 use hetida_db::flush::{FlushConfig, FlushScheduler, Flusher};
 use hetida_db::parquet::ParquetConfig;
+use hetida_db::retention::Reaper;
 use hetida_db::storage::FileStorage;
 
 /// Where the archive lives, unless `HETIDA_DATA_DIR` says otherwise.
@@ -38,6 +39,13 @@ const COMPACT_TICK: std::time::Duration = std::time::Duration::from_secs(300);
 /// Far below the age bound it enforces, so a partition is flushed close to when
 /// it becomes due rather than up to a whole tick late.
 const FLUSH_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often the reaper looks for expired partitions (§8).
+///
+/// Comfortably below the finest partition interval, which is an hour (§11):
+/// nothing can become expired and be dropped more than a quarter of an interval
+/// late. Reaping more often would only relist directories that cannot yet have
+/// changed.
+const REAP_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -169,6 +177,61 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // §8: expired data is removed by dropping whole partition directories, by
+    // event time. A table with no configured retention is never examined, so an
+    // archive nobody gave a horizon can never lose anything to this task.
+    let reaping = tokio::spawn({
+        let archive = Arc::clone(&archive);
+        let storage = Arc::clone(&storage);
+        async move {
+            let mut timer = tokio::time::interval(REAP_TICK);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let reaper = Reaper::new(Arc::clone(&storage) as Arc<_>, archive.interval());
+            let clock = SystemClock;
+
+            loop {
+                timer.tick().await;
+                let now = clock.now_micros();
+                for table in archive.catalogue().table_names() {
+                    let Some(retention) = archive.catalogue().config(&table).retention else {
+                        continue;
+                    };
+                    match reaper.reap(&table, Some(retention), now) {
+                        Ok(pass) => {
+                            for directory in &pass.dropped {
+                                println!(
+                                    "hetida-db: dropped expired partition {}",
+                                    directory.display()
+                                );
+                            }
+                            if pass.failed > 0 {
+                                // Not fatal — the next pass retries — but an
+                                // archive that cannot shed data grows without
+                                // bound, so it is never silent.
+                                eprintln!(
+                                    "hetida-db: {} expired partition(s) of `{table}` \
+                                     could not be dropped; will retry",
+                                    pass.failed
+                                );
+                            }
+                            if pass.unrecognised > 0 {
+                                eprintln!(
+                                    "hetida-db: {} directory/ies under `{table}` do not \
+                                     match the {} layout and were left alone",
+                                    pass.unrecognised,
+                                    archive.interval(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("hetida-db: could not reap `{table}`: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let address = listen
         .parse()
         .with_context(|| format!("`{listen}` is not a socket address"))?;
@@ -182,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
 
     flushing.abort();
     compacting.abort();
+    reaping.abort();
     println!("hetida-db: stopped");
     Ok(())
 }

@@ -24,11 +24,11 @@
 //! would be grouped into one partition and written into another.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use arrow::temporal_conversions::timestamp_us_to_datetime;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Days, Months, NaiveDate, NaiveDateTime, TimeDelta, Timelike};
 
 use crate::clock::Micros;
 
@@ -84,13 +84,26 @@ impl PartitionInterval {
         }
         .ok_or(PartitionError::Unrepresentable(timestamp))?;
 
-        // Via whole seconds: a truncated instant has no sub-second part, and
-        // `timestamp_micros` panics outside its range where this cannot.
-        truncated
-            .and_utc()
-            .timestamp()
-            .checked_mul(1_000_000)
-            .ok_or(PartitionError::Unrepresentable(timestamp))
+        micros_of(truncated).ok_or(PartitionError::Unrepresentable(timestamp))
+    }
+
+    /// Exclusive end of the partition `timestamp` falls in.
+    ///
+    /// Exactly where the next partition starts, so the intervals tile valid time
+    /// without gap or overlap. Retention needs this rather than a fixed span: a
+    /// calendar month is 28 to 31 days, and adding 30 would expire February
+    /// early and January late (§8).
+    pub fn end(&self, timestamp: Micros) -> Result<Micros, PartitionError> {
+        let at = datetime(self.start(timestamp)?)?;
+        let next = match self {
+            Self::Hour => at.checked_add_signed(TimeDelta::hours(1)),
+            Self::Day => at.checked_add_days(Days::new(1)),
+            Self::Month => at.checked_add_months(Months::new(1)),
+            Self::Year => at.checked_add_months(Months::new(12)),
+        }
+        .ok_or(PartitionError::Unrepresentable(timestamp))?;
+
+        micros_of(next).ok_or(PartitionError::Unrepresentable(timestamp))
     }
 
     /// Hive-style directory of the partition `timestamp` falls in.
@@ -109,6 +122,50 @@ impl PartitionInterval {
         }
 
         Ok(path)
+    }
+
+    /// The start of the partition `path` names, if it names one at all.
+    ///
+    /// The inverse of [`Self::path`], and the reaper's only way to date a
+    /// directory it found by listing (§8). Leading components are ignored, so a
+    /// full `data/<table>/year=…/month=…` reads as well as a bare layout path.
+    ///
+    /// `None` rather than a guess for anything this layout would not have
+    /// written — a wrong reading here deletes the wrong partition. The check is
+    /// exactly that: what was parsed has to render back to the same path.
+    pub fn start_of_path(&self, path: &Path) -> Option<Micros> {
+        let names: Vec<&str> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect();
+        let tail = names.get(names.len().checked_sub(self.depth())?..)?;
+
+        // year, month, day, hour — the defaults are what a coarser interval's
+        // partition starts at.
+        let mut fields: [i64; 4] = [0, 1, 1, 0];
+        for (level, component) in tail.iter().enumerate() {
+            let (key, value) = component.split_once('=')?;
+            if Some(&key) != LEVEL_KEYS.get(level) {
+                return None;
+            }
+            *fields.get_mut(level)? = value.parse().ok()?;
+        }
+
+        let at = NaiveDate::from_ymd_opt(
+            i32::try_from(*fields.first()?).ok()?,
+            u32::try_from(*fields.get(1)?).ok()?,
+            u32::try_from(*fields.get(2)?).ok()?,
+        )?
+        .and_hms_opt(u32::try_from(*fields.get(3)?).ok()?, 0, 0)?;
+        let start = micros_of(at)?;
+
+        // Rendering it back is the whole check: a path this layout would not
+        // have written — a level missing, a component unpadded, the year and
+        // month swapped — cannot survive it.
+        (self.path(start).ok()? == tail.iter().collect::<PathBuf>()).then_some(start)
     }
 
     /// How many directory levels this interval's layout has.
@@ -153,6 +210,17 @@ impl fmt::Display for PartitionInterval {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// The Hive key at each level, outermost first (§11).
+const LEVEL_KEYS: [&str; 4] = ["year", "month", "day", "hour"];
+
+/// A partition boundary as microseconds since the epoch, if it fits.
+///
+/// Via whole seconds: a boundary has no sub-second part, and `timestamp_micros`
+/// panics outside its range where this cannot.
+fn micros_of(at: NaiveDateTime) -> Option<Micros> {
+    at.and_utc().timestamp().checked_mul(1_000_000)
 }
 
 /// Midnight on the first of a month, if that date exists.
@@ -303,6 +371,63 @@ mod tests {
     fn an_unrepresentable_timestamp_is_an_error() {
         assert!(PartitionInterval::Day.path(Micros::MAX).is_err());
         assert!(PartitionInterval::Day.start(Micros::MIN).is_err());
+        assert!(PartitionInterval::Day.end(Micros::MAX).is_err());
+    }
+
+    /// §8: retention needs the calendar end of a partition, and a calendar
+    /// month is 28 to 31 days. A fixed span would expire February early and
+    /// January late.
+    #[test]
+    fn the_end_follows_the_calendar_not_a_fixed_span() {
+        const DAY: Micros = 86_400_000_000;
+        // 2026-02-14T00:00:00Z, in a 28-day month.
+        let february = 1_770_940_800_000_000;
+        let start = PartitionInterval::Month.start(february).unwrap();
+
+        assert_eq!(
+            PartitionInterval::Month.end(february).unwrap() - start,
+            28 * DAY,
+            "february 2026 is 28 days"
+        );
+        // 2026-03-14T00:00:00Z, in a 31-day month.
+        let march = 1_773_446_400_000_000;
+        assert_eq!(
+            PartitionInterval::Month.end(march).unwrap()
+                - PartitionInterval::Month.start(march).unwrap(),
+            31 * DAY
+        );
+    }
+
+    /// §8: the reaper decides from a directory listing, so a path has to read
+    /// back as the partition it names.
+    #[test]
+    fn a_partition_path_reads_back_as_its_start() {
+        let full = PathBuf::from("data/readings/year=2026/month=08");
+        assert_eq!(
+            PartitionInterval::Month.start_of_path(&full),
+            Some(1_785_542_400_000_000), // 2026-08-01T00:00:00Z
+            "the table prefix must not confuse the reader"
+        );
+    }
+
+    /// Never a guess: a directory this layout did not write reads as nothing,
+    /// so the reaper cannot delete something it does not understand (§8).
+    #[test]
+    fn a_path_this_layout_did_not_write_reads_as_nothing() {
+        for text in [
+            "data/readings/year=2026",            // too shallow for `month`
+            "data/readings/year=2026/month=13",   // no such month
+            "data/readings/year=2026/week=31",    // not a level of this layout
+            "data/readings/month=08/year=2026",   // levels swapped
+            "data/readings/year=2026/month=8",    // not the padding we write
+            "data/readings/year=2026/month=08/x", // a file, not a partition
+        ] {
+            assert_eq!(
+                PartitionInterval::Month.start_of_path(std::path::Path::new(text)),
+                None,
+                "{text} was read as a partition"
+            );
+        }
     }
 
     /// Sane range for properties: 1900-01-01 to 2200-01-01, comfortably inside
@@ -376,6 +501,38 @@ mod tests {
             prop_assert!(month <= day);
             prop_assert!(day <= hour);
             prop_assert!(hour <= timestamp);
+        }
+
+        /// §8: retention drops a partition once its *entire* interval is past
+        /// the cutoff, which is only meaningful if the end is exactly where the
+        /// next partition begins — no gap the calendar leaves unaccounted for.
+        #[test]
+        fn the_end_is_where_the_next_partition_begins(
+            timestamp in any_timestamp(),
+            interval in any_interval(),
+        ) {
+            let end = interval.end(timestamp)?;
+            prop_assert!(end > timestamp, "the end must lie past the timestamp");
+            prop_assert_eq!(interval.start(end)?, end, "the end is itself a boundary");
+            prop_assert_eq!(
+                interval.start(end - 1)?,
+                interval.start(timestamp)?,
+                "the microsecond before the end still belongs to the partition"
+            );
+        }
+
+        /// §8: the reaper reads a partition's start back out of its directory
+        /// name. If that were ever inexact it would drop the wrong directory.
+        #[test]
+        fn a_rendered_path_reads_back_as_its_start(
+            timestamp in any_timestamp(),
+            interval in any_interval(),
+        ) {
+            let path = interval.path(timestamp)?;
+            prop_assert_eq!(
+                interval.start_of_path(&path),
+                Some(interval.start(timestamp)?)
+            );
         }
 
         /// The path is a prefix chain for the same reason: `hour` sits under the

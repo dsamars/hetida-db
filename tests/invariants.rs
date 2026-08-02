@@ -5,10 +5,12 @@
 //!
 //! Examples cannot cover the invariants this archive rests on, so they are
 //! stated as properties over generated input. Alongside the Phase 0 foundation
-//! it holds the first of the three §1 invariants, suppression being idempotent.
-//! The remaining two — version resolution at arbitrary observation points, and
-//! sort order surviving flush and compaction — join it once the components they
-//! describe exist.
+//! it holds the first of the three §1 invariants, suppression being idempotent,
+//! and the §8 retention rules — that a dropped partition never took a row
+//! younger than the cutoff, and that rejection on ingest and reaping on disk are
+//! the same rule seen from two sides. The remaining two §1 invariants — version
+//! resolution at arbitrary observation points, and sort order surviving flush
+//! and compaction — join them once the components they describe exist.
 //!
 //! Being an integration test, this also proves the injection points are
 //! reachable and object-safe from outside the crate. A test double that only
@@ -24,6 +26,8 @@ use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64A
 use arrow::datatypes::{DataType, Field, Schema};
 use hetida_db::active::ActiveMemTable;
 use hetida_db::clock::{Clock, Micros, TestClock};
+use hetida_db::partition::PartitionInterval;
+use hetida_db::retention::{Reaper, is_expired};
 use hetida_db::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, append_system_fields, timestamp_type};
 use hetida_db::seq::{AtomicSequence, Seq, SequenceSource};
 use hetida_db::stamp::Stamper;
@@ -31,6 +35,7 @@ use hetida_db::storage::{Fault, InMemoryStorage, Storage};
 use hetida_db::suppression::SuppressionConfig;
 use hetida_db::wal::{RecordKind, WalConfig, WalRecord, WalWriter, replay};
 use proptest::prelude::*;
+use proptest::test_runner::TestCaseError;
 
 /// Generates a record with an arbitrary kind, sequence number and payload.
 fn any_record() -> impl Strategy<Value = WalRecord> {
@@ -83,6 +88,49 @@ fn client_row(metric_id: u64, timestamp: Micros, value: f64) -> RecordBatch {
         ],
     )
     .expect("client row")
+}
+
+/// Sane range for time properties: 1900-01-01 to 2200-01-01, comfortably inside
+/// what a calendar represents and wider than any archive will hold.
+fn any_timestamp() -> impl Strategy<Value = Micros> {
+    -2_208_988_800_000_000i64..7_258_118_400_000_000i64
+}
+
+fn any_interval() -> impl Strategy<Value = PartitionInterval> {
+    prop_oneof![
+        Just(PartitionInterval::Hour),
+        Just(PartitionInterval::Day),
+        Just(PartitionInterval::Month),
+        Just(PartitionInterval::Year),
+    ]
+}
+
+/// Writes one Parquet-shaped file into the partition each timestamp belongs to,
+/// and returns the store beside each timestamp's directory.
+///
+/// The reaper decides from the listing alone, so the file contents are
+/// irrelevant — what matters is that the directories are the ones the real
+/// layout would have produced (§11).
+fn partitioned(
+    timestamps: &[Micros],
+    interval: PartitionInterval,
+) -> Result<(InMemoryStorage, Vec<PathBuf>), TestCaseError> {
+    let storage = InMemoryStorage::new();
+    let mut dirs = Vec::with_capacity(timestamps.len());
+
+    for (index, timestamp) in timestamps.iter().enumerate() {
+        let directory = Path::new("data/readings").join(
+            interval
+                .path(*timestamp)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?,
+        );
+        let mut file = storage.open_append(&directory.join(format!("part-{index}.parquet")))?;
+        file.append(b"rows")?;
+        file.sync()?;
+        dirs.push(directory);
+    }
+
+    Ok((storage, dirs))
 }
 
 /// Every injection point must survive being stored as a trait object, which is
@@ -242,6 +290,77 @@ proptest! {
             versions(false),
             "retransmitting every batch manufactured versions"
         );
+    }
+
+    /// §8: retention never deletes a row younger than the cutoff. A partition
+    /// goes only when its *whole* interval is past it, so every timestamp the
+    /// reaper takes with a directory lies strictly behind the cutoff — checked
+    /// against the real reaper over a real listing, not against the predicate
+    /// the reaper itself uses.
+    #[test]
+    fn a_reaped_partition_holds_nothing_younger_than_the_cutoff(
+        timestamps in prop::collection::vec(any_timestamp(), 1..12),
+        interval in any_interval(),
+        cutoff in any_timestamp(),
+    ) {
+        let (storage, dirs) = partitioned(&timestamps, interval)?;
+        let pass = Reaper::new(Arc::new(storage), interval)
+            .reap("readings", Some(0), cutoff)
+            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+
+        for (timestamp, directory) in timestamps.iter().zip(&dirs) {
+            if pass.dropped.contains(directory) {
+                prop_assert!(
+                    *timestamp < cutoff,
+                    "a row at {} was dropped at cutoff {cutoff}",
+                    timestamp
+                );
+            }
+        }
+    }
+
+    /// §8: the rejection rule and the reaping rule are one rule. Anything
+    /// `do_put` accepts lands in a partition the reaper is not entitled to drop
+    /// at that same instant — otherwise the archive would acknowledge data it is
+    /// about to delete. And anything it refuses is genuinely reapable, so the
+    /// refusal never turns away data the archive would have kept.
+    #[test]
+    fn accepting_and_reaping_are_exactly_complementary(
+        timestamps in prop::collection::vec(any_timestamp(), 1..12),
+        interval in any_interval(),
+        cutoff in any_timestamp(),
+    ) {
+        let (storage, dirs) = partitioned(&timestamps, interval)?;
+        let pass = Reaper::new(Arc::new(storage), interval)
+            .reap("readings", Some(0), cutoff)
+            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+
+        for (timestamp, directory) in timestamps.iter().zip(&dirs) {
+            let refused = is_expired(interval, *timestamp, cutoff)?;
+            prop_assert_eq!(
+                refused,
+                pass.dropped.contains(directory),
+                "ingest and the reaper disagree about {}",
+                timestamp
+            );
+        }
+    }
+
+    /// §8: a dropped partition never comes back, so the reaper cannot flap.
+    /// Expiry is monotone in the cutoff, which is monotone in the clock.
+    #[test]
+    fn expiry_is_monotone_in_the_cutoff(
+        timestamp in any_timestamp(),
+        interval in any_interval(),
+        earlier in any_timestamp(),
+        delta in 0i64..(400 * 86_400_000_000),
+    ) {
+        if is_expired(interval, timestamp, earlier)? {
+            prop_assert!(
+                is_expired(interval, timestamp, earlier.saturating_add(delta))?,
+                "a partition expired at {earlier} was live {delta} µs later"
+            );
+        }
     }
 
     /// §4: a torn write always leaves a prefix of the intended bytes, never a

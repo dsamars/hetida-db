@@ -32,13 +32,14 @@ use arrow::array::RecordBatch;
 
 use crate::catalog::{CatalogueError, TableCatalogue, TableConfig};
 use crate::catalog_log::{CATALOG_LOG_DIR, DATA_LOG_DIR, WalCatalogLog, replay_catalog};
-use crate::clock::Clock;
+use crate::clock::{Clock, Micros};
 use crate::data_log::{encode_batch, replay_data};
 use crate::instance::{InstanceError, InstanceMetadata};
 use crate::memtable::{InsertOutcome, MemTableError};
-use crate::partition::PartitionInterval;
+use crate::partition::{PartitionError, PartitionInterval};
 use crate::registry::{MetricRegistry, RegistryError};
-use crate::schema::SEQ_COLUMN;
+use crate::retention::{cutoff, is_expired};
+use crate::schema::{SEQ_COLUMN, TIMESTAMP_COLUMN};
 use crate::seq::{AtomicSequence, Seq, SequenceSource};
 use crate::stamp::StampError;
 use crate::stamp::Stamper;
@@ -73,6 +74,25 @@ pub enum IngestError {
         /// The configured cap.
         cap: usize,
     },
+    /// The batch reaches into a partition retention has already released (§8).
+    ///
+    /// The one age-based rejection in the system, and an explicit configured
+    /// policy — not the lateness watermark §3 rules out. Retrying unchanged
+    /// never helps: the cutoff only moves further forward.
+    #[error(
+        "the oldest row is stamped {oldest} µs, in a partition entirely past the \
+         retention cutoff of {cutoff} µs; that partition may be dropped at any \
+         time, so the batch is refused rather than written and reaped"
+    )]
+    Expired {
+        /// Valid time of the oldest row in the refused batch.
+        oldest: Micros,
+        /// The cutoff it fell behind.
+        cutoff: Micros,
+    },
+    /// A row's timestamp could not be placed on the calendar (§11).
+    #[error(transparent)]
+    Partition(#[from] PartitionError),
 }
 
 /// Why an archive could not be opened.
@@ -154,6 +174,7 @@ pub struct Archive {
     interval: PartitionInterval,
     registry: Arc<MetricRegistry>,
     catalogue: Arc<TableCatalogue>,
+    clock: Arc<dyn Clock>,
     stamper: Arc<Stamper>,
     tables: dashmap::DashMap<String, Arc<PartitionedTable>>,
     data_log: Arc<Wal>,
@@ -225,6 +246,7 @@ impl Archive {
             interval,
             registry,
             catalogue,
+            clock: Arc::clone(&clock),
             stamper: Arc::new(Stamper::new(clock, sequence)),
             tables: dashmap::DashMap::new(),
             data_log,
@@ -277,8 +299,11 @@ impl Archive {
             });
         }
 
-        // §6: evolution and rejection happen before anything is logged.
+        // §6: evolution and rejection happen before anything is logged. This
+        // also settles that the timestamp column is present and typed, which the
+        // retention check below reads.
         self.catalogue.accept(table, batch.schema().as_ref())?;
+        self.refuse_if_expired(table, batch)?;
         let stamped = self.stamper.stamp(batch)?;
 
         // §4: durable before acknowledged, and before it is visible in memory —
@@ -296,6 +321,35 @@ impl Archive {
             )))
         })?;
         Ok(state.insert(&stamped)?)
+    }
+
+    /// Refuses a batch reaching into a partition retention has released (§8).
+    ///
+    /// Exactly the reaper's rule, applied to the batch's oldest row: if that
+    /// row's partition is already droppable, writing it would mean acknowledging
+    /// data the next reaping pass deletes. A row merely older than the horizon
+    /// but sharing a partition with live data is accepted, because that
+    /// partition is kept and served (§8, §11).
+    ///
+    /// The whole batch is refused rather than filtered: splitting it would copy
+    /// it, which the hot-path rule forbids, and a client sending expired data has
+    /// a bug worth reporting rather than silently trimming.
+    ///
+    /// A table without a retention duration — the default — costs one map lookup
+    /// and no scan at all.
+    fn refuse_if_expired(&self, table: &str, batch: &RecordBatch) -> Result<(), IngestError> {
+        let Some(retention) = self.catalogue.config(table).retention else {
+            return Ok(());
+        };
+        let Some(oldest) = oldest_timestamp(batch) else {
+            return Ok(());
+        };
+
+        let cutoff = cutoff(self.clock.now_micros(), retention);
+        if is_expired(self.interval, oldest, cutoff)? {
+            return Err(IngestError::Expired { oldest, cutoff });
+        }
+        Ok(())
     }
 
     /// Bytes the memtables of every table currently hold (§7).
@@ -358,6 +412,20 @@ impl Archive {
                 .value(),
         ))
     }
+}
+
+/// The earliest valid time a client batch carries, if it carries any (§8).
+///
+/// An Arrow aggregate over the one column, not a row walk: the hot-path rule
+/// bans per-row iteration, and this runs only for a table with a retention
+/// duration.
+fn oldest_timestamp(batch: &RecordBatch) -> Option<Micros> {
+    arrow::compute::min(
+        batch
+            .column_by_name(TIMESTAMP_COLUMN)?
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()?,
+    )
 }
 
 /// The first `seq` a stamped batch carries, which numbers its log record.
@@ -573,6 +641,7 @@ mod tests {
                 "forecast".to_owned(),
                 TableConfig {
                     suppression: SuppressionConfig::for_recomputed(HOUR),
+                    ..TableConfig::default()
                 },
             )],
             ..config()
@@ -838,6 +907,155 @@ mod tests {
             archive.table("readings").unwrap().partition_starts().len(),
             2,
             "both partitions must come back"
+        );
+    }
+
+    // ---- retention (§8) ----
+
+    /// 2026-08-02T14:37:12Z, and two months before it.
+    const AUGUST: Micros = 1_785_681_432_000_000;
+    const JUNE: Micros = 1_781_481_600_000_000;
+    const DAY: Micros = 86_400_000_000;
+
+    fn retaining(days: Micros) -> ArchiveConfig {
+        ArchiveConfig {
+            tables: vec![(
+                "readings".to_owned(),
+                TableConfig {
+                    retention: Some(days * DAY),
+                    ..TableConfig::default()
+                },
+            )],
+            ..config()
+        }
+    }
+
+    fn at(storage: &InMemoryStorage, config: &ArchiveConfig, now: Micros) -> Archive {
+        Archive::open(
+            Arc::new(storage.clone()),
+            config,
+            Arc::new(TestClock::new(now)),
+        )
+        .expect("archive")
+    }
+
+    /// §8: data whose partition the reaper is already entitled to drop is
+    /// refused outright, rather than written and deleted moments later.
+    #[test]
+    fn ingesting_already_expired_data_is_refused() {
+        let storage = InMemoryStorage::new();
+        let archive = at(&storage, &retaining(30), AUGUST);
+
+        let error = archive
+            .ingest("readings", &client_batch(&[(1, JUNE, 1.5)]))
+            .expect_err("must be refused");
+
+        assert!(matches!(error, IngestError::Expired { .. }), "{error}");
+        assert!(archive.table("readings").is_none_or(|t| t.num_rows() == 0));
+    }
+
+    /// §8: the refusal is exactly the reaper's rule. A row inside a partition
+    /// still partly live is accepted, because that partition will be served —
+    /// refusing it would reject data the archive would in fact have kept.
+    #[test]
+    fn a_row_older_than_the_horizon_but_in_a_live_partition_is_accepted() {
+        let storage = InMemoryStorage::new();
+        // A one-day horizon at 2026-08-02T14:37 puts the cutoff at
+        // 2026-08-01T14:37 — inside August, whose partition therefore survives.
+        let archive = at(&storage, &retaining(1), AUGUST);
+        let first_of_august = PartitionInterval::Month.start(AUGUST).unwrap();
+
+        let outcome = archive
+            .ingest("readings", &client_batch(&[(1, first_of_august, 1.5)]))
+            .expect("a live partition must accept a row behind the horizon");
+
+        assert_eq!(outcome.inserted, 1, "the row is older than the horizon");
+        assert!(
+            first_of_august < crate::retention::cutoff(AUGUST, DAY),
+            "the test is only meaningful if the row is behind the cutoff"
+        );
+    }
+
+    /// §8: unset retention keeps forever, so nothing is ever too old.
+    #[test]
+    fn without_retention_no_data_is_too_old() {
+        let storage = InMemoryStorage::new();
+        let archive = at(&storage, &config(), AUGUST);
+
+        assert!(
+            archive
+                .ingest("readings", &client_batch(&[(1, 0, 1.5)]))
+                .is_ok(),
+            "1970 must be accepted by a table that keeps everything"
+        );
+    }
+
+    /// §4: a refused batch must leave nothing behind — no log record, no rows.
+    #[test]
+    fn an_expired_batch_is_not_logged() {
+        let storage = InMemoryStorage::new();
+        {
+            let archive = at(&storage, &retaining(30), AUGUST);
+            archive
+                .ingest("readings", &client_batch(&[(1, AUGUST, 1.5)]))
+                .expect("live");
+            assert!(
+                archive
+                    .ingest("readings", &client_batch(&[(1, JUNE, 2.5)]))
+                    .is_err()
+            );
+        }
+
+        let reopened = at(&storage, &config(), AUGUST);
+        assert_eq!(reopened.recovered().data_records, 1);
+    }
+
+    /// The batch is passed through uncopied (hot-path rule), so it is refused
+    /// whole rather than split — but the refusal must name the row that caused
+    /// it, or an operator cannot tell which of a thousand rows was too old.
+    #[test]
+    fn a_batch_with_one_expired_row_is_refused_whole_and_names_it() {
+        let storage = InMemoryStorage::new();
+        let archive = at(&storage, &retaining(30), AUGUST);
+
+        let error = archive
+            .ingest(
+                "readings",
+                &client_batch(&[(1, AUGUST, 1.5), (1, JUNE, 2.5)]),
+            )
+            .expect_err("must be refused");
+
+        assert!(matches!(error, IngestError::Expired { oldest, .. } if oldest == JUNE));
+        assert_eq!(
+            archive.table("readings").map_or(0, |t| t.num_rows()),
+            0,
+            "no part of a refused batch may land"
+        );
+    }
+
+    /// §8: the cutoff moves with the clock, so the same batch that is accepted
+    /// today is refused once its partition has cleared.
+    #[test]
+    fn the_same_batch_is_refused_once_its_partition_has_cleared() {
+        let storage = InMemoryStorage::new();
+        let clock = Arc::new(TestClock::new(AUGUST));
+        let archive = Archive::open(
+            Arc::new(storage.clone()),
+            &retaining(30),
+            Arc::clone(&clock) as Arc<_>,
+        )
+        .unwrap();
+
+        archive
+            .ingest("readings", &client_batch(&[(1, AUGUST, 1.5)]))
+            .expect("august is live");
+
+        clock.set(AUGUST + 120 * DAY);
+        assert!(
+            archive
+                .ingest("readings", &client_batch(&[(1, AUGUST, 2.5)]))
+                .is_err(),
+            "august has cleared the cutoff by December"
         );
     }
 

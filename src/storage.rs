@@ -80,6 +80,17 @@ pub trait Storage: fmt::Debug + Send + Sync {
     /// Deletes an object. Removing an absent object succeeds.
     fn remove(&self, path: &Path) -> StorageResult<()>;
 
+    /// Deletes `prefix` and everything beneath it.
+    ///
+    /// This is how retention removes expired data (§8): a whole partition
+    /// directory at once, never rows out of a file. Removing an absent prefix
+    /// succeeds — a reaper racing a concurrent pass finds the desired state
+    /// already true.
+    ///
+    /// `prefix` matches on whole path components, so dropping `month=07` never
+    /// takes a `month=07-old` beside it.
+    fn remove_dir_all(&self, prefix: &Path) -> StorageResult<()>;
+
     /// Moves `from` onto `to`, replacing `to` if it exists.
     ///
     /// Atomic: a reader sees either the old object or the whole new one, never a
@@ -112,7 +123,7 @@ pub enum Fault {
         /// Number of leading bytes that reach storage.
         keep: usize,
     },
-    /// Fail the next append or sync with this error kind.
+    /// Fail the next append, sync or directory removal with this error kind.
     Fail(io::ErrorKind),
 }
 
@@ -211,6 +222,24 @@ impl Storage for InMemoryStorage {
 
     fn remove(&self, path: &Path) -> StorageResult<()> {
         self.lock().objects.remove(path);
+        Ok(())
+    }
+
+    fn remove_dir_all(&self, prefix: &Path) -> StorageResult<()> {
+        let mut state = self.lock();
+        // Injectable, because §8's reaper must count a failed drop and carry on
+        // rather than abandon the pass — untestable otherwise.
+        if let Some(Fault::Fail(kind)) = state.faults.pop_front() {
+            return Err(StorageError::Io {
+                path: prefix.to_path_buf(),
+                source: io::Error::from(kind),
+            });
+        }
+        // `strip_prefix` matches whole components, so `year=2026` never takes
+        // `year=2026-old` with it — the sibling the string form would eat.
+        state
+            .objects
+            .retain(|path, _| path.strip_prefix(prefix).is_err());
         Ok(())
     }
 }
@@ -335,6 +364,15 @@ impl Storage for FileStorage {
     fn remove(&self, path: &Path) -> StorageResult<()> {
         let resolved = self.resolve(path);
         match fs::remove_file(&resolved) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::from_io(&resolved, e)),
+        }
+    }
+
+    fn remove_dir_all(&self, prefix: &Path) -> StorageResult<()> {
+        let resolved = self.resolve(prefix);
+        match fs::remove_dir_all(&resolved) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(StorageError::from_io(&resolved, e)),
@@ -535,6 +573,70 @@ mod tests {
         assert!(storage.list(Path::new("wal")).unwrap().is_empty());
     }
 
+    /// §8: retention drops a whole partition directory. Removing the files one
+    /// by one would leave the directory behind, and the archive's shape is its
+    /// directory listing (§11).
+    #[test]
+    fn remove_dir_all_drops_a_whole_partition() {
+        let storage = InMemoryStorage::new();
+        for name in [
+            "data/readings/year=2026/month=07/part-0.parquet",
+            "data/readings/year=2026/month=07/part-1.parquet",
+            "data/readings/year=2026/month=08/part-0.parquet",
+        ] {
+            storage
+                .open_append(Path::new(name))
+                .unwrap()
+                .sync()
+                .unwrap();
+        }
+
+        storage
+            .remove_dir_all(Path::new("data/readings/year=2026/month=07"))
+            .unwrap();
+
+        assert_eq!(
+            storage.list(Path::new("data/readings/year=2026")).unwrap(),
+            vec![PathBuf::from("data/readings/year=2026/month=08")],
+            "the dropped partition must be gone, the neighbour untouched"
+        );
+    }
+
+    /// The reaper may race a concurrent pass or a manual cleanup, so an absent
+    /// directory is not an error — the desired state is already the case.
+    #[test]
+    fn removing_an_absent_directory_succeeds() {
+        let storage = InMemoryStorage::new();
+        assert!(
+            storage
+                .remove_dir_all(Path::new("data/readings/year=1999"))
+                .is_ok()
+        );
+    }
+
+    /// A prefix must be a whole path component, or dropping `month=07` would
+    /// also take `month=07-old` with it.
+    #[test]
+    fn remove_dir_all_does_not_take_a_sibling_sharing_a_name_prefix() {
+        let storage = InMemoryStorage::new();
+        for name in ["data/t/year=2026/part-0", "data/t/year=2026-old/part-0"] {
+            storage
+                .open_append(Path::new(name))
+                .unwrap()
+                .sync()
+                .unwrap();
+        }
+
+        storage
+            .remove_dir_all(Path::new("data/t/year=2026"))
+            .unwrap();
+
+        assert_eq!(
+            storage.list(Path::new("data/t")).unwrap(),
+            vec![PathBuf::from("data/t/year=2026-old")]
+        );
+    }
+
     #[test]
     fn storage_is_object_safe() {
         let storage: Box<dyn Storage> = Box::new(InMemoryStorage::new());
@@ -611,6 +713,40 @@ mod file_tests {
         assert_eq!(
             storage.list(Path::new("wal")).unwrap(),
             vec![PathBuf::from("wal/000002")]
+        );
+    }
+
+    /// The in-memory double is only useful if the real store drops a directory
+    /// the same way (§8).
+    #[test]
+    fn file_storage_removes_a_whole_directory() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = FileStorage::new(root.path());
+        for name in [
+            "data/t/year=2026/month=07/part-0",
+            "data/t/year=2026/month=08/part-0",
+        ] {
+            storage
+                .open_append(Path::new(name))
+                .unwrap()
+                .sync()
+                .unwrap();
+        }
+
+        storage
+            .remove_dir_all(Path::new("data/t/year=2026/month=07"))
+            .unwrap();
+
+        assert_eq!(
+            storage.list(Path::new("data/t/year=2026")).unwrap(),
+            vec![PathBuf::from("data/t/year=2026/month=08")],
+            "the directory itself must be gone, not just its files"
+        );
+        assert!(
+            storage
+                .remove_dir_all(Path::new("data/t/year=2026/month=07"))
+                .is_ok(),
+            "dropping it again must succeed"
         );
     }
 

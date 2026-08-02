@@ -33,6 +33,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use dashmap::DashMap;
 
 use crate::catalog_log::SchemaRecord;
+use crate::clock::Micros;
 use crate::schema::{SchemaError, TableSchema};
 use crate::suppression::SuppressionConfig;
 
@@ -64,6 +65,15 @@ pub trait SchemaLog: std::fmt::Debug + Send + Sync {
 pub struct TableConfig {
     /// Reach of unchanged-value suppression for this table (§1).
     pub suppression: SuppressionConfig,
+    /// How long this table's data is kept, by event time (§8).
+    ///
+    /// `None` — the default — keeps it forever. Retention deletes, so it is
+    /// never inferred: an archive nobody configured a horizon for must not start
+    /// dropping partitions because a duration looked plausible.
+    ///
+    /// Resolution can never be finer than the partition interval, since whole
+    /// directories are dropped (§8, §11). Choose the two together.
+    pub retention: Option<Micros>,
 }
 
 /// Maps table names to their schema and configuration (§6).
@@ -503,6 +513,7 @@ mod tests {
             "forecast",
             TableConfig {
                 suppression: SuppressionConfig::for_recomputed(HOUR),
+                ..TableConfig::default()
             },
         );
 
@@ -514,6 +525,34 @@ mod tests {
             catalogue.config("readings").suppression.window,
             SuppressionConfig::for_stream().window,
             "an unconfigured table must fall back to the instance default"
+        );
+    }
+
+    /// §8: retention is configured per table as a duration, and unset means keep
+    /// forever. An archive without an explicit policy must never start deleting.
+    #[test]
+    fn retention_is_per_table_and_unset_means_forever() {
+        const NINETY_DAYS: Micros = 90 * 86_400_000_000;
+
+        let (_log, catalogue) = fresh();
+        catalogue.configure(
+            "readings",
+            TableConfig {
+                retention: Some(NINETY_DAYS),
+                ..TableConfig::default()
+            },
+        );
+
+        assert_eq!(catalogue.config("readings").retention, Some(NINETY_DAYS));
+        assert_eq!(
+            catalogue.config("audit").retention,
+            None,
+            "an unconfigured table must keep everything"
+        );
+        assert_eq!(
+            TableConfig::default().retention,
+            None,
+            "the default must not delete anything"
         );
     }
 
@@ -529,6 +568,7 @@ mod tests {
             "forecast",
             TableConfig {
                 suppression: SuppressionConfig::for_recomputed(HOUR),
+                ..TableConfig::default()
             },
         );
 

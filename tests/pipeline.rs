@@ -24,7 +24,7 @@ use hetida_db::active::ActiveMemTable;
 use hetida_db::archive::{Archive, ArchiveConfig};
 use hetida_db::catalog::{TableCatalogue, TableConfig};
 use hetida_db::catalog_log::{CATALOG_LOG_DIR, WalCatalogLog, replay_catalog};
-use hetida_db::clock::{Micros, TestClock};
+use hetida_db::clock::{Clock, Micros, TestClock};
 use hetida_db::instance::InstanceMetadata;
 use hetida_db::memtable::RowKey;
 use hetida_db::partition::PartitionInterval;
@@ -38,6 +38,10 @@ use hetida_db::wal::{Wal, WalConfig};
 
 /// One hour of ingest time.
 const HOUR: Micros = 3_600_000_000;
+/// One day of ingest time.
+const DAY: Micros = 86_400_000_000;
+/// 2026-06-15T00:00:00Z — two months before the rest.
+const JUNE: Micros = 1_781_481_600_000_000;
 /// 2026-08-02T14:00:00Z.
 const AUGUST: Micros = 1_785_681_432_000_000;
 /// 2026-09-01T00:00:00Z — the next month's partition.
@@ -555,4 +559,95 @@ fn ingested_rows_reach_parquet_and_make_the_log_reclaimable() {
         ),
         None
     );
+}
+
+/// §8: the retention path end to end, across the four components that have to
+/// agree on it — the catalogue holding the duration, the flusher placing files
+/// by event time, the reaper reading that placement back out of the directory
+/// names, and `do_put` refusing what the reaper would take.
+///
+/// The last step is the one no unit test can reach: after the June partition is
+/// gone, re-sending June has to be refused rather than quietly recreating a
+/// directory the next pass deletes again.
+#[test]
+fn expired_partitions_are_dropped_and_their_range_is_then_refused() {
+    use hetida_db::archive::IngestError;
+    use hetida_db::catalog::TableConfig;
+    use hetida_db::compact::partition_dirs;
+    use hetida_db::flush::Flusher;
+    use hetida_db::parquet::ParquetConfig;
+    use hetida_db::retention::Reaper;
+
+    let storage = InMemoryStorage::new();
+    let clock = Arc::new(TestClock::new(JUNE));
+    let config = ArchiveConfig {
+        wal: wal_config(),
+        tables: vec![(
+            "readings".to_owned(),
+            TableConfig {
+                retention: Some(30 * DAY),
+                ..TableConfig::default()
+            },
+        )],
+        ..ArchiveConfig::default()
+    };
+    let archive = Archive::open(
+        Arc::new(storage.clone()),
+        &config,
+        Arc::clone(&clock) as Arc<_>,
+    )
+    .expect("archive");
+
+    // June is written while June is live, then the clock moves on and August is
+    // written. Both reach Parquet.
+    archive
+        .ingest("readings", &client_batch(&[(1, JUNE, 1.5)]))
+        .expect("june is live in june");
+    clock.set(AUGUST);
+    archive
+        .ingest("readings", &client_batch(&[(1, AUGUST, 2.5)]))
+        .expect("august");
+
+    let state = archive.table("readings").expect("readings");
+    let flusher = Flusher::new(
+        Arc::new(storage.clone()),
+        "readings",
+        archive.interval(),
+        ParquetConfig::default(),
+    );
+    for start in state.partition_starts() {
+        flusher.flush(&state, start).expect("flush");
+    }
+    assert_eq!(
+        partition_dirs(&storage, "readings", archive.interval())
+            .unwrap()
+            .len(),
+        2,
+        "both partitions must be on disk before anything is reaped"
+    );
+
+    // 30 days back from 2026-08-02 puts the cutoff inside July, so June has
+    // cleared it entirely and August has not.
+    let pass = Reaper::new(Arc::new(storage.clone()), archive.interval())
+        .reap("readings", Some(30 * DAY), clock.now_micros())
+        .expect("reap");
+
+    assert_eq!(pass.dropped.len(), 1, "exactly june");
+    assert_eq!(
+        partition_dirs(&storage, "readings", archive.interval()).unwrap(),
+        vec![std::path::PathBuf::from("data/readings/year=2026/month=08")],
+        "august must be untouched — retention drops partitions, not rows"
+    );
+
+    // And the range is now closed to writes: re-sending June must be refused
+    // rather than recreating a directory the next pass deletes again (§8).
+    let error = archive
+        .ingest("readings", &client_batch(&[(1, JUNE, 1.5)]))
+        .expect_err("june is past the cutoff now");
+    assert!(matches!(error, IngestError::Expired { .. }), "{error}");
+
+    // August, which the reaper kept, still accepts writes.
+    archive
+        .ingest("readings", &client_batch(&[(1, AUGUST, 3.5)]))
+        .expect("a retained partition must stay writable");
 }

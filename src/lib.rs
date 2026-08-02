@@ -25,8 +25,8 @@
 //! batch in it ([`table`]), the startup sequence that assembles all of it
 //! ([`archive`]) and the Flight surface serving it ([`flight`]), with batches
 //! made durable through the data log ([`data_log`]) and archived as Parquet
-//! ([`parquet`]) by the flusher ([`flush`]) and merged by the compactor
-//! ([`compact`]).
+//! ([`parquet`]) by the flusher ([`flush`]), merged by the compactor
+//! ([`compact`]) and expired by the reaper ([`retention`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -71,6 +71,7 @@ pub mod proto {
 }
 
 pub mod registry;
+pub mod retention;
 pub mod schema;
 pub mod seq;
 pub mod stamp;

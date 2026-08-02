@@ -337,7 +337,7 @@ pub fn partition_dirs(
     storage: &dyn Storage,
     table: &str,
     interval: PartitionInterval,
-) -> Result<Vec<std::path::PathBuf>, CompactError> {
+) -> Result<Vec<std::path::PathBuf>, StorageError> {
     let mut level = vec![std::path::Path::new(DATA_DIR).join(table)];
 
     for _ in 0..interval.depth() {
