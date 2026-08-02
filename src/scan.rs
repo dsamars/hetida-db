@@ -18,7 +18,7 @@
 //!
 //! Every input is individually in `(metric_id, timestamp, seq)` order: a file
 //! because the writer refuses anything else (§1), a memtable because
-//! [`MemTable::sorted_batch`] produces it. The plan therefore ends in a
+//! [`MemTable::sorted_batch`](crate::memtable::MemTable::sorted_batch) produces it. The plan therefore ends in a
 //! *sort-preserving merge* rather than a sort — which is what lets as-of
 //! resolution be a streaming merge instead of a full sort (§1).
 //!
@@ -399,13 +399,19 @@ impl TimeBounds {
                 let Some((operator, value)) = timestamp_comparison(binary) else {
                     return;
                 };
+                // Strict comparisons exclude the bound itself. Treating `<` as
+                // `<=` would keep a partition that begins exactly where the
+                // predicate ends — the commonest case there is, since a client
+                // asks for a month by naming the next month's first instant.
                 match operator {
                     Operator::Eq => {
                         self.low = self.low.max(value);
                         self.high = self.high.min(value);
                     }
-                    Operator::Gt | Operator::GtEq => self.low = self.low.max(value),
-                    Operator::Lt | Operator::LtEq => self.high = self.high.min(value),
+                    Operator::Gt => self.low = self.low.max(value.saturating_add(1)),
+                    Operator::GtEq => self.low = self.low.max(value),
+                    Operator::Lt => self.high = self.high.min(value.saturating_sub(1)),
+                    Operator::LtEq => self.high = self.high.min(value),
                     _ => {}
                 }
             }
@@ -508,6 +514,10 @@ mod tests {
         assert!(bounds.overlaps(1_500, 1_600));
         assert!(bounds.overlaps(1_999, 3_000));
         assert!(!bounds.overlaps(2_001, 3_000), "begins after it ends");
+        assert!(
+            !bounds.overlaps(2_000, 3_000),
+            "a partition beginning exactly where `< 2000` ends holds nothing"
+        );
     }
 
     #[test]
@@ -519,7 +529,7 @@ mod tests {
     #[test]
     fn a_conjunction_narrows_from_both_halves() {
         let bounds = TimeBounds::of(&[col_expr(TIMESTAMP_COLUMN)
-            .gt(stamp(10))
+            .gt_eq(stamp(10))
             .and(col_expr(TIMESTAMP_COLUMN).lt_eq(stamp(20)))]);
         assert_eq!(bounds, TimeBounds { low: 10, high: 20 });
     }
@@ -532,7 +542,7 @@ mod tests {
         let written = TimeBounds::of(&[col_expr(TIMESTAMP_COLUMN).gt(stamp(1_000))]);
         let flipped = TimeBounds::of(&[stamp(1_000).lt(col_expr(TIMESTAMP_COLUMN))]);
         assert_eq!(written, flipped);
-        assert_eq!(written.low, 1_000);
+        assert_eq!(written.low, 1_001, "`>` excludes its own bound");
     }
 
     /// An unreadable predicate must widen, never narrow: a wrong reading here

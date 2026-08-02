@@ -58,6 +58,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::archive::Archive;
 use crate::clock::Micros;
+use crate::labels::{LabelPushdown, has_label_udf};
 use crate::object_store::StorageObjectStore;
 use crate::scan::{ArchiveTable, STORE_URL};
 use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, SYSTEM_TIME_COLUMN, TIMESTAMP_COLUMN};
@@ -100,7 +101,18 @@ impl QueryEngine {
     ///
     /// `None` observes now — the current state, every version included (§1).
     pub async fn session(&self, as_of: Option<Micros>) -> Result<SessionContext, QueryError> {
-        let context = SessionContext::new_with_config(streaming_config());
+        // §10: the label marker is resolved against the registry before the
+        // plan is optimised, so what reaches the scan is a filter on
+        // `metric_id` that row-group statistics can prune.
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_config(streaming_config())
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(LabelPushdown::new(Arc::clone(
+                self.archive.registry(),
+            ))))
+            .build();
+        let context = SessionContext::new_with_state(state);
+        context.register_udf(has_label_udf());
         context.runtime_env().register_object_store(
             ObjectStoreUrl::parse(STORE_URL)?.as_ref(),
             Arc::new(StorageObjectStore::new(Arc::clone(&self.storage))),
@@ -787,6 +799,147 @@ mod tests {
             series.iter().map(RecordBatch::num_rows).sum::<usize>(),
             2,
             "both series must be listed, labelled or not"
+        );
+    }
+
+    // ---- pruning and projection (§10, §11) ----
+
+    /// Registers `count` series, each with a `plant` label, and writes one row
+    /// per series into Parquet.
+    async fn many_metrics(fixture: &Fixture, count: u64) {
+        for index in 0..count {
+            let id = fixture
+                .archive
+                .registry()
+                .register(SeriesKey::new(
+                    format!("metric-{index}"),
+                    [("plant".to_owned(), format!("p{index}"))],
+                ))
+                .unwrap();
+            fixture
+                .archive
+                .ingest("readings", &client_batch(&[(id, AUGUST, index as f64)]))
+                .unwrap();
+        }
+        flush_all(fixture, "readings");
+    }
+
+    /// §10, §11: a label predicate becomes literals on `metric_id`, which is
+    /// what row-group statistics prune on. A join would reach the scan as a
+    /// join and read everything.
+    #[tokio::test]
+    async fn a_label_predicate_reaches_the_scan_as_a_filter_on_metric_id() {
+        let fixture = fixture();
+        many_metrics(&fixture, 8).await;
+
+        let plan = fixture
+            .engine
+            .plan_text(
+                "SELECT * FROM readings WHERE hetida_label('plant', 'p3')",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            plan.contains(METRIC_ID_COLUMN) && !plan.contains("hetida_label"),
+            "the marker must be resolved away, not carried into the plan:\n{plan}"
+        );
+        assert_eq!(
+            rows(
+                &fixture,
+                "SELECT * FROM readings WHERE hetida_label('plant', 'p3')",
+                None
+            )
+            .await
+            .len(),
+            1,
+            "and it must still answer the right rows"
+        );
+    }
+
+    /// §10: a label nothing carries answers nothing. `true` would silently
+    /// widen the question.
+    #[tokio::test]
+    async fn an_unknown_label_answers_nothing() {
+        let fixture = fixture();
+        many_metrics(&fixture, 4).await;
+
+        assert!(
+            rows(
+                &fixture,
+                "SELECT * FROM readings WHERE hetida_label('plant', 'nowhere')",
+                None
+            )
+            .await
+            .is_empty()
+        );
+    }
+
+    /// §11: pruning is measured by bytes scanned, not by wall time. A query
+    /// over one partition must not read the other one's file at all.
+    #[tokio::test]
+    async fn a_bounded_predicate_leaves_the_other_partition_unopened() {
+        const SEPTEMBER: Micros = 1_788_220_800_000_000;
+
+        let fixture = fixture();
+        fixture
+            .archive
+            .ingest(
+                "readings",
+                &client_batch(&[(1, AUGUST, 1.5), (2, SEPTEMBER, 2.5)]),
+            )
+            .unwrap();
+        flush_all(&fixture, "readings");
+
+        let plan = fixture
+            .engine
+            .plan_text(
+                &format!(
+                    "SELECT * FROM readings WHERE \"timestamp\" < \
+                     arrow_cast({SEPTEMBER}, 'Timestamp(Microsecond, None)')"
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(plan.contains("month=08"), "august must be scanned:\n{plan}");
+        assert!(
+            !plan.contains("month=09"),
+            "september is entirely past the predicate and must not be opened:\n{plan}"
+        );
+    }
+
+    /// §11: a projection must reach the Parquet reader, so a query for one
+    /// column does not pay for the others. Measured in bytes, deterministically.
+    #[tokio::test]
+    async fn a_narrow_projection_reads_fewer_bytes() {
+        let fixture = fixture();
+        many_metrics(&fixture, 64).await;
+
+        fixture.storage.reset_bytes_read();
+        fixture
+            .engine
+            .collect("SELECT * FROM \"readings$history\"", None)
+            .await
+            .unwrap();
+        let whole = fixture.storage.bytes_read();
+
+        fixture.storage.reset_bytes_read();
+        fixture
+            .engine
+            .collect(
+                &format!("SELECT {METRIC_ID_COLUMN} FROM \"readings$history\""),
+                None,
+            )
+            .await
+            .unwrap();
+        let narrow = fixture.storage.bytes_read();
+
+        assert!(
+            narrow < whole,
+            "projection did not reach the reader: {narrow} bytes vs {whole}"
         );
     }
 

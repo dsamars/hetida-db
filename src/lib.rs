@@ -28,7 +28,8 @@
 //! ([`parquet`]) by the flusher ([`flush`]), merged by the compactor
 //! ([`compact`]) and expired by the reaper ([`retention`]), and with the whole
 //! archive queryable through DataFusion ([`query`]) over a scan that spans
-//! memory and Parquet ([`scan`], [`object_store`]).
+//! memory and Parquet ([`scan`], [`object_store`]) and label predicates
+//! resolved into filters on `metric_id` ([`labels`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -53,6 +54,7 @@ pub mod data_log;
 pub mod flight;
 pub mod flush;
 pub mod instance;
+pub mod labels;
 pub mod memtable;
 pub mod object_store;
 pub mod parquet;

@@ -159,6 +159,7 @@ struct MemoryState {
     objects: BTreeMap<PathBuf, Vec<u8>>,
     faults: VecDeque<Fault>,
     syncs: usize,
+    bytes_read: usize,
 }
 
 impl InMemoryStorage {
@@ -172,6 +173,21 @@ impl InMemoryStorage {
     /// Lets a test observe fsync grouping (§4), which is otherwise invisible.
     pub fn syncs(&self) -> usize {
         self.lock().syncs
+    }
+
+    /// Bytes any handle has read out of this store through a range read.
+    ///
+    /// Lets a test measure pruning the way §11 asks it to be measured — by
+    /// bytes scanned, not by wall time, which would be a benchmark and a flaky
+    /// test. Whole-object reads are excluded: the query path uses ranges, and
+    /// counting the compactor's reads would drown the signal.
+    pub fn bytes_read(&self) -> usize {
+        self.lock().bytes_read
+    }
+
+    /// Forgets what has been read so far, so a test can measure one query.
+    pub fn reset_bytes_read(&self) {
+        self.lock().bytes_read = 0;
     }
 
     /// Queues a fault for the next append or sync.
@@ -217,10 +233,12 @@ impl Storage for InMemoryStorage {
         let end = usize::try_from(range.end)
             .unwrap_or(usize::MAX)
             .min(bytes.len());
-        Ok(bytes
+        let served = bytes
             .get(start..end.max(start))
             .unwrap_or_default()
-            .to_vec())
+            .to_vec();
+        self.lock().bytes_read += served.len();
+        Ok(served)
     }
 
     fn size(&self, path: &Path) -> StorageResult<Option<u64>> {
