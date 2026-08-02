@@ -16,10 +16,11 @@
 //!
 //! Implemented so far: the Phase 0 test foundation ([`clock`], [`seq`],
 //! [`storage`]) and most of the Phase 1 data model — table schemas with their
-//! evolution rules ([`schema`]), the metric registry ([`registry`]), the
-//! system-column stamper ([`stamp`]), the versioned table with freeze-and-swap
-//! ([`memtable`], [`active`]) and its suppression state ([`suppression`]), and
-//! the write-ahead log ([`wal`]).
+//! evolution rules ([`schema`]), the metric registry ([`registry`]) with its
+//! never-reclaimed log ([`registry_log`]), the system-column stamper
+//! ([`stamp`]), the versioned table with freeze-and-swap ([`memtable`],
+//! [`active`]) and its suppression state ([`suppression`]), and the write-ahead
+//! log ([`wal`]).
 
 #![warn(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -28,6 +29,7 @@ pub mod active;
 pub mod clock;
 pub mod memtable;
 pub mod registry;
+pub mod registry_log;
 pub mod schema;
 pub mod seq;
 pub mod stamp;

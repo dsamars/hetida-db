@@ -19,7 +19,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
 - [ ] Build the multi-table catalogue mapping table name to its `TableSchema` and its per-table configuration — suppression window and entry cap (§1), retention duration (§8) — applying evolution on ingest and surfacing rejections as explicit Flight errors (§6).
 - [x] Build the metric registry mapping name + label set to a `u64` id, idempotent on re-registration, durable before visible through a `RegistrationLog` seam (§10).
-- [ ] Back the registry's `RegistrationLog` with its own never-reclaimed log, replayed before the data log, and expose the registry as a queryable catalog table (§4, §10).
+- [x] Back the registry's `RegistrationLog` with its own never-reclaimed log and recover it on start, skipping a torn tail (§4, §10). *The startup sequence that replays it ahead of the data log lands with `do_put`; the ordering rule is recorded in §4.*
 - [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
 - [x] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [x] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
@@ -46,6 +46,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [ ] Expose each table as an as-of-resolved view plus `<table>$history` carrying the raw versions with `system_time` and `seq` as ordinary columns (§1, §5).
 - [ ] Implement predicate pushdown and column projection for Parquet readers, including partition pruning via the Hive-style layout and row-group skipping on `system_time` and `metric_id` (§11).
 - [ ] Resolve label predicates against the registry into a `metric_id` set and push that down as a filter on `metric_id` (§10).
+- [ ] Expose the registry as a queryable catalog table, so labels are reachable from SQL rather than only through the registration action (§10). *Split off the Phase 1 registration-log task, which it needed DataFusion for.*
 - [ ] Implement `get_flight_info` and `get_schema` so generic Flight clients can follow the standard `get_flight_info` → `do_get` flow, accepting the same `{sql, as_of}` payload in the descriptor `cmd` (§5).
 - [ ] Implement Arrow Flight `do_get` endpoint: parse `{sql, as_of}` from the `Ticket`, run it through DataFusion and stream results directly to clients via Arrow IPC (§5).
 - [ ] Implement TLS termination and Flight `Handshake` issuing bearer tokens, validated by a `tonic` interceptor once per call — never per streamed message (§9).
