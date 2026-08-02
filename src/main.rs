@@ -18,12 +18,19 @@ use tonic::transport::Server;
 use hetida_db::archive::{Archive, ArchiveConfig};
 use hetida_db::clock::SystemClock;
 use hetida_db::flight::HetidaFlightService;
+use hetida_db::flush::{FlushConfig, FlushScheduler, Flusher};
+use hetida_db::parquet::ParquetConfig;
 use hetida_db::storage::FileStorage;
 
 /// Where the archive lives, unless `HETIDA_DATA_DIR` says otherwise.
 const DEFAULT_DATA_DIR: &str = "hetida-data";
 /// Address to serve on, unless `HETIDA_LISTEN` says otherwise.
 const DEFAULT_LISTEN: &str = "127.0.0.1:50051";
+/// How often the flusher looks for due partitions (§2).
+///
+/// Far below the age bound it enforces, so a partition is flushed close to when
+/// it becomes due rather than up to a whole tick late.
+const FLUSH_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,10 +38,11 @@ async fn main() -> anyhow::Result<()> {
     let listen = std::env::var("HETIDA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
 
     let storage = Arc::new(FileStorage::new(PathBuf::from(&data_dir)));
+    let storage_for_archive = Arc::clone(&storage);
     let config = ArchiveConfig::default();
 
     let archive = Arc::new(
-        Archive::open(storage, &config, Arc::new(SystemClock))
+        Archive::open(storage_for_archive, &config, Arc::new(SystemClock))
             .with_context(|| format!("could not open the archive in `{data_dir}`"))?,
     );
 
@@ -65,6 +73,50 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // §2: one scheduler per table, driving flushes in the background so
+    // ingestion never waits for one. Tables appear as clients write to them, so
+    // the set is rebuilt on each tick rather than fixed at startup.
+    let flush_config = FlushConfig::default();
+    let flushing = tokio::spawn({
+        let archive = Arc::clone(&archive);
+        let storage_for_flush = Arc::clone(&storage);
+        async move {
+            let mut timer = tokio::time::interval(FLUSH_TICK);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let clock: Arc<dyn hetida_db::clock::Clock> = Arc::new(SystemClock);
+
+            loop {
+                timer.tick().await;
+                for table in archive.catalogue().table_names() {
+                    let Some(state) = archive.table(&table) else {
+                        continue;
+                    };
+                    let scheduler = FlushScheduler::new(
+                        Flusher::new(
+                            Arc::clone(&storage_for_flush) as Arc<_>,
+                            table.clone(),
+                            archive.interval(),
+                            ParquetConfig::default(),
+                        ),
+                        flush_config,
+                        Arc::clone(&clock),
+                    );
+                    let pass = scheduler.run_once(&state);
+                    if pass.failed > 0 {
+                        // §7: the rows stay, memory grows, and ingestion is
+                        // refused before anything is lost. Silence here would
+                        // make that chain unexplainable.
+                        eprintln!(
+                            "hetida-db: {} partition(s) of `{table}` failed to flush; \
+                             ingestion will be refused if memory fills",
+                            pass.failed
+                        );
+                    }
+                }
+            }
+        }
+    });
+
     let address = listen
         .parse()
         .with_context(|| format!("`{listen}` is not a socket address"))?;
@@ -76,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("the Flight server stopped with an error")?;
 
+    flushing.abort();
     println!("hetida-db: stopped");
     Ok(())
 }

@@ -155,6 +155,20 @@ impl PartitionedTable {
             .sum()
     }
 
+    /// When the oldest row a partition still holds arrived (§2).
+    pub fn oldest_system_time(&self, start: Micros) -> Option<Micros> {
+        self.partitions
+            .get(&start)
+            .and_then(|entry| entry.value().current().oldest_system_time())
+    }
+
+    /// Bytes one partition holds (§2).
+    pub fn partition_bytes(&self, start: Micros) -> usize {
+        self.partitions
+            .get(&start)
+            .map_or(0, |entry| entry.value().current().memory_bytes())
+    }
+
     /// The lowest `seq` any partition still holds (§4).
     pub fn min_seq(&self) -> Option<Seq> {
         self.partitions

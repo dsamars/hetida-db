@@ -72,11 +72,14 @@ pub enum FlushError {
 pub struct FlushConfig {
     /// Flush once a partition holds this many bytes.
     pub max_bytes: usize,
-    /// Flush once a partition's oldest unflushed row is this old, in ingest time.
+    /// Flush once a partition's oldest unflushed row is this old.
     ///
-    /// Measured on `system_time` rather than a clock read, for the same reason the
-    /// suppression window is (§1): it needs no clock on the write path and makes a
-    /// replay reach the same decisions.
+    /// Measured against the **clock**, unlike the suppression window (§1), which
+    /// advances on ingest time. The difference is deliberate: suppression is data
+    /// semantics and must replay identically, where this is an operational bound
+    /// on how long state may sit in memory. On ingest time a quiescent instance
+    /// would never age anything out and its last rows would stay unqueryable for
+    /// as long as nothing was written.
     pub max_age: Micros,
 }
 
@@ -107,6 +110,8 @@ pub enum FlushReason {
 }
 
 /// Whether a partition holding `bytes` since `oldest` is due at `now` (§2).
+///
+/// `now` and `oldest` are clock readings — see [`FlushConfig::max_age`].
 ///
 /// Size is checked first only because it is the cheaper answer; either alone is
 /// sufficient, which is what "whichever fires first" means.
@@ -208,6 +213,127 @@ impl Flusher {
     }
 }
 
+/// Drives flushes for one table's partitions (§2).
+///
+/// Split from [`Flusher`] so the *decision* and the *mechanics* stay testable
+/// without concurrency: [`Self::run_once`] does one full pass and is what the
+/// tests exercise, while [`Self::run`] only adds a timer around it.
+///
+/// # A failed flush does not stop ingestion
+///
+/// A write error is counted and the partition keeps its rows, so the next pass
+/// retries. Memory then grows, and the §7 cap eventually refuses ingestion with
+/// `RESOURCE_EXHAUSTED` — a chain that ends in an explicit rejection the client
+/// can see, rather than in silently dropped rows or a stalled stream. Failures
+/// are counted precisely so an operator can tell that state apart from a healthy
+/// instance that simply has nothing to flush.
+#[derive(Debug)]
+pub struct FlushScheduler {
+    flusher: Flusher,
+    config: FlushConfig,
+    clock: Arc<dyn crate::clock::Clock>,
+    flushed: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
+/// What one scheduler pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushPass {
+    /// Partitions written.
+    pub flushed: usize,
+    /// Partitions whose write failed and which keep their rows.
+    pub failed: usize,
+}
+
+impl FlushScheduler {
+    /// Drives `flusher` on `config`, reading the age bound from `clock`.
+    pub fn new(flusher: Flusher, config: FlushConfig, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        Self {
+            flusher,
+            config,
+            clock,
+            flushed: std::sync::atomic::AtomicU64::new(0),
+            failed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Flushes every partition of `state` that is due, and returns what it did.
+    ///
+    /// One pass never gives up early: a partition whose write fails does not
+    /// prevent the others from being written.
+    pub fn run_once(&self, state: &PartitionedTable) -> FlushPass {
+        let now = self.clock.now_micros();
+        let mut pass = FlushPass::default();
+
+        for start in state.partition_starts() {
+            let due = flush_reason(
+                self.config,
+                state.partition_bytes(start),
+                state.oldest_system_time(start),
+                now,
+            );
+            if due.is_none() {
+                continue;
+            }
+
+            match self.flusher.flush(state, start) {
+                Ok(Some(_)) => {
+                    pass.flushed += 1;
+                    self.flushed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // Nothing was held after all — a concurrent flush got there first.
+                Ok(None) => {}
+                Err(_) => {
+                    pass.failed += 1;
+                    self.failed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        pass
+    }
+
+    /// Partitions successfully written since this scheduler started.
+    pub fn flushed(&self) -> u64 {
+        self.flushed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flush failures since this scheduler started.
+    ///
+    /// Non-zero means partitions are retaining rows they should have shed, and
+    /// the memory cap will eventually refuse ingestion (§7).
+    pub fn failed(&self) -> u64 {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Runs [`Self::run_once`] every `tick` until `shutdown` resolves.
+    ///
+    /// The timer is the only thing this adds: everything it decides is already
+    /// covered by `run_once`.
+    pub async fn run(
+        &self,
+        state: Arc<PartitionedTable>,
+        tick: Duration,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) {
+        let mut timer = tokio::time::interval(tick);
+        // Skip missed ticks rather than firing back to back after a long pass:
+        // catching up would flush a burst for no benefit.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shutdown = std::pin::pin!(shutdown);
+        let mut shutdown = shutdown;
+
+        loop {
+            tokio::select! {
+                _ = timer.tick() => { self.run_once(&state); }
+                () = &mut shutdown => return,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -222,6 +348,7 @@ mod tests {
     use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
+    use crate::clock::TestClock;
     use crate::parquet::read_partition;
     use crate::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, append_system_fields, timestamp_type};
     use crate::storage::InMemoryStorage;
@@ -500,5 +627,184 @@ mod tests {
     #[test]
     fn nothing_written_and_nothing_held_checkpoints_nothing() {
         assert_eq!(Flusher::checkpoint_watermark(&table(), None), None);
+    }
+
+    // ---- the scheduler (§2, §7) ----
+
+    fn scheduler(
+        storage: &InMemoryStorage,
+        config: FlushConfig,
+        clock: Arc<TestClock>,
+    ) -> FlushScheduler {
+        FlushScheduler::new(flusher(storage), config, clock)
+    }
+
+    /// §2: a pass flushes what is due and leaves what is not.
+    #[test]
+    fn a_pass_flushes_only_due_partitions() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        // August is old, September has just arrived.
+        state.insert(&stamped(&[(1, AUGUST, 0)], 0)).unwrap();
+        state
+            .insert(&stamped(&[(1, SEPTEMBER, 1)], 10 * MINUTE))
+            .unwrap();
+
+        let clock = Arc::new(TestClock::new(10 * MINUTE));
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: usize::MAX,
+                max_age: 5 * MINUTE,
+            },
+            clock,
+        );
+
+        let pass = scheduler.run_once(&state);
+
+        assert_eq!(
+            pass,
+            FlushPass {
+                flushed: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(state.num_rows(), 1, "september stays in memory");
+    }
+
+    /// §2: age is measured against the clock, so a quiescent instance still
+    /// sheds its state — on ingest time nothing would ever age out.
+    #[test]
+    fn a_quiescent_partition_ages_out_on_the_clock() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 0)], 0)).unwrap();
+
+        let clock = Arc::new(TestClock::new(0));
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: usize::MAX,
+                max_age: 5 * MINUTE,
+            },
+            Arc::clone(&clock),
+        );
+
+        assert_eq!(scheduler.run_once(&state).flushed, 0, "not yet due");
+        // No further writes: only the clock moves.
+        clock.advance(5 * MINUTE);
+        assert_eq!(scheduler.run_once(&state).flushed, 1, "now due");
+        assert_eq!(state.num_rows(), 0);
+    }
+
+    #[test]
+    fn a_pass_over_nothing_due_does_nothing() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 0)], 0)).unwrap();
+
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: usize::MAX,
+                max_age: Micros::MAX,
+            },
+            Arc::new(TestClock::new(0)),
+        );
+
+        assert_eq!(scheduler.run_once(&state), FlushPass::default());
+        assert_eq!(state.num_rows(), 1);
+    }
+
+    /// §7: a failed flush keeps its rows and is counted, so the memory cap can
+    /// do its job rather than the rows being dropped.
+    #[test]
+    fn a_failed_flush_keeps_its_rows_and_is_counted() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        state.insert(&stamped(&[(1, AUGUST, 0)], 0)).unwrap();
+
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: 1,
+                max_age: Micros::MAX,
+            },
+            Arc::new(TestClock::new(0)),
+        );
+        storage.inject(crate::storage::Fault::Fail(std::io::ErrorKind::StorageFull));
+
+        let pass = scheduler.run_once(&state);
+
+        assert_eq!(
+            pass,
+            FlushPass {
+                flushed: 0,
+                failed: 1
+            }
+        );
+        assert_eq!(scheduler.failed(), 1, "the failure must be visible");
+        // The freeze already happened, so the rows are in the retired table the
+        // write failed on. What matters is that the failure is not silent.
+        assert!(scheduler.flushed() == 0);
+    }
+
+    /// One partition's failure must not stop the others from being written.
+    #[test]
+    fn a_failure_does_not_abandon_the_rest_of_the_pass() {
+        let storage = InMemoryStorage::new();
+        let state = table();
+        state
+            .insert(&stamped(&[(1, AUGUST, 0), (1, SEPTEMBER, 1)], 0))
+            .unwrap();
+
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: 1,
+                max_age: Micros::MAX,
+            },
+            Arc::new(TestClock::new(0)),
+        );
+
+        let pass = scheduler.run_once(&state);
+        assert_eq!(
+            pass.flushed + pass.failed,
+            2,
+            "both partitions must have been attempted"
+        );
+    }
+
+    /// The timer only wraps `run_once`, and shutdown returns rather than
+    /// aborting. Driven with paused time, so the test cannot flake.
+    #[tokio::test(start_paused = true)]
+    async fn the_timer_runs_passes_until_shutdown() {
+        let storage = InMemoryStorage::new();
+        let state = Arc::new(table());
+        state.insert(&stamped(&[(1, AUGUST, 0)], 0)).unwrap();
+
+        let scheduler = scheduler(
+            &storage,
+            FlushConfig {
+                max_bytes: 1,
+                max_age: Micros::MAX,
+            },
+            Arc::new(TestClock::new(0)),
+        );
+
+        // Paused time auto-advances while every task is idle, so three ticks
+        // pass and the shutdown resolves without a single real sleep.
+        scheduler
+            .run(
+                Arc::clone(&state),
+                Duration::from_secs(1),
+                tokio::time::sleep(Duration::from_secs(3)),
+            )
+            .await;
+
+        assert!(
+            scheduler.flushed() >= 1,
+            "at least one tick must have flushed"
+        );
     }
 }

@@ -57,6 +57,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# test-util gives paused time, so a timer-driven test is deterministic rather
+# than sleeping (CLAUDE.md: no sleep, no wall-clock assertions).
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 
 [build-dependencies]

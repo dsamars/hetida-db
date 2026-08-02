@@ -31,7 +31,7 @@
 //! swap (§2) retires the table first, and only then is it read.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use arrow::array::{
@@ -111,6 +111,12 @@ pub struct MemTable {
     index: DashMap<RowKey, Vec<VersionRef>>,
     suppression: Arc<SuppressionIndex>,
     writers: AtomicUsize,
+    /// `system_time` of the first batch admitted, or `i64::MAX` while empty.
+    ///
+    /// One atomic rather than a scan: the flush trigger asks on every tick, and
+    /// `system_time` is non-decreasing with `seq` (§1), so the first batch
+    /// admitted carries the oldest one this table will ever hold.
+    oldest_system_time: AtomicI64,
 }
 
 impl MemTable {
@@ -147,6 +153,7 @@ impl MemTable {
             index: DashMap::new(),
             suppression,
             writers: AtomicUsize::new(0),
+            oldest_system_time: AtomicI64::new(Micros::MAX),
         })
     }
 
@@ -195,9 +202,12 @@ impl MemTable {
         let seqs = self.u64_column(batch, SEQ_COLUMN)?.values().to_vec();
         let digests = self.payload_digests(batch)?;
 
+        let system_time = self.batch_system_time(batch)?;
         // Advance the window before anything is compared, so state older than
         // the configured reach can no longer suppress a row (§1).
-        self.suppression.observe(self.batch_system_time(batch)?);
+        self.suppression.observe(system_time);
+        self.oldest_system_time
+            .fetch_min(system_time, Ordering::Relaxed);
 
         let keep = self.decide(&keys, &seqs, &digests);
         let kept = keep.iter().filter(|keep| **keep).count();
@@ -361,6 +371,14 @@ impl MemTable {
             (version.key.metric_id, version.key.timestamp, version.seq)
         });
         all
+    }
+
+    /// When the oldest row this table holds arrived, if any.
+    ///
+    /// Drives the age half of the flush trigger (§2).
+    pub fn oldest_system_time(&self) -> Option<Micros> {
+        let held = self.oldest_system_time.load(Ordering::Relaxed);
+        (held != Micros::MAX).then_some(held)
     }
 
     /// The lowest `seq` this table holds, if any.
