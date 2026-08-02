@@ -177,7 +177,15 @@ both cannot be meant, and choosing one would be exactly the guess this refuses
 to make.
 
 TLS is terminated by `tonic` using `rustls` with the `ring` backend, chosen over
-`aws-lc` because it builds without `cmake` or a C toolchain.
+`aws-lc` because it builds without `cmake` or a C toolchain. Both PEM files are
+read **at startup**, so a missing or unreadable identity stops the start rather
+than failing the first connection that needs it.
+
+`tests/tls.rs` drives the whole chain against a certificate generated for the
+run: TOML text → `[server]` → PEM read → a real handshake → `do_put` and
+`do_get` over the connection. It also confirms that a plaintext client cannot
+reach the listener, and that a client which does not trust the certificate is
+refused.
 
 ### Users and grants
 

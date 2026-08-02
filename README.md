@@ -92,7 +92,7 @@ The observation point travels in the `Ticket` beside the SQL as `hetida.v1.Query
 
 All four phases in [`tasks.md`](tasks.md) are complete: the write path, Parquet archival with compaction and retention, the query engine with as-of resolution, TLS and per-table authorization, and the Phase 4 benchmarks and verification suite.
 
-Development is strictly test-driven, and `cargo test` and `cargo clippy -- -D warnings` must pass before any task is complete.
+Development is strictly test-driven, and `cargo test` and `cargo clippy -- -D warnings` must pass before any task is complete. TLS is covered end to end against a certificate generated for the run, so nothing about the secure path rests on inspection alone.
 
 ## Measuring
 

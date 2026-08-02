@@ -149,6 +149,48 @@ impl TransportConfig {
     }
 }
 
+/// Why a TLS identity could not be loaded (§9).
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    /// A PEM file could not be read.
+    #[error("could not read `{path}`: {source}")]
+    Unreadable {
+        /// The file that was named.
+        path: PathBuf,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+    /// The identity was refused by the TLS stack.
+    #[error("the TLS identity was refused: {0}")]
+    Refused(String),
+}
+
+/// The server TLS configuration `transport` describes, or `None` for plaintext.
+///
+/// Reads both PEM files here, at startup, so a missing or unreadable identity
+/// stops the start rather than failing the first connection that needs it.
+pub fn tls_config(
+    transport: &TransportConfig,
+) -> Result<Option<tonic::transport::ServerTlsConfig>, TlsError> {
+    let TransportConfig::Tls { certificate, key } = transport else {
+        return Ok(None);
+    };
+
+    let chain = read_pem(certificate)?;
+    let private = read_pem(key)?;
+    Ok(Some(tonic::transport::ServerTlsConfig::new().identity(
+        tonic::transport::Identity::from_pem(chain, private),
+    )))
+}
+
+/// Reads a PEM file, reporting the path rather than only the errno.
+fn read_pem(path: &Path) -> Result<Vec<u8>, TlsError> {
+    std::fs::read(path).map_err(|source| TlsError::Unreadable {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// One configured user, before their password has been read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserSpec {

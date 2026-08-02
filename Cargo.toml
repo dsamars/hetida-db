@@ -82,6 +82,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # invalidates its estimates. That measurement has its own harness.
 criterion = "0.7"
 proptest = "1"
+# A self-signed certificate for the TLS test (§9). Generated in the test rather
+# than checked in: a committed key is a key, however clearly it is labelled a
+# test one, and one that expires turns a passing suite into a failing one.
+rcgen = "0.14"
 # The load harness writes into a temporary archive when none is configured.
 tempfile = "3"
 # test-util gives paused time, so a timer-driven test is deterministic rather

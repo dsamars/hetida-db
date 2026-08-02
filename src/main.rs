@@ -24,9 +24,7 @@ use hetida_db::flight::BearerInterceptor;
 use hetida_db::flight::HetidaFlightService;
 use hetida_db::flush::{FlushScheduler, Flusher};
 use hetida_db::retention::Reaper;
-use hetida_db::serve::{
-    AuthConfig, TransportConfig, Warning, readable_beyond_owner, retired_in_use,
-};
+use hetida_db::serve::{AuthConfig, Warning, readable_beyond_owner, retired_in_use, tls_config};
 use hetida_db::storage::FileStorage;
 
 #[tokio::main]
@@ -254,19 +252,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut server = Server::builder();
-    match &transport {
-        TransportConfig::Tls { certificate, key } => {
-            let identity = tonic::transport::Identity::from_pem(
-                std::fs::read(certificate)
-                    .with_context(|| format!("could not read {}", certificate.display()))?,
-                std::fs::read(key).with_context(|| format!("could not read {}", key.display()))?,
-            );
+    match tls_config(&transport).context("the TLS identity could not be loaded")? {
+        Some(tls) => {
             server = server
-                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .tls_config(tls)
                 .context("the TLS identity was refused")?;
             println!("hetida-db: serving Arrow Flight over TLS on {address}");
         }
-        TransportConfig::Plaintext => {
+        None => {
             println!("hetida-db: serving Arrow Flight on {address}");
             eprintln!(
                 "hetida-db: no TLS — a bearer token travels in a header, and \
