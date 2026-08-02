@@ -21,8 +21,9 @@
 //! never-reclaimed catalogue log ([`catalog_log`]), the system-column stamper
 //! ([`stamp`]), the versioned table with freeze-and-swap ([`memtable`],
 //! [`active`]) and its suppression state ([`suppression`]), the write-ahead log
-//! ([`wal`]), the partition layout ([`partition`]) and the routing that places a
-//! batch in it ([`table`]).
+//! ([`wal`]), the partition layout ([`partition`]), the routing that places a
+//! batch in it ([`table`]) and the startup sequence that assembles all of it
+//! ([`archive`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -38,6 +39,7 @@
 )]
 
 pub mod active;
+pub mod archive;
 pub mod catalog;
 pub mod catalog_log;
 pub mod clock;
