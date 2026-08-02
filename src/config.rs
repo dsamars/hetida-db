@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Heiko Dietz
 
-//! The archive configuration file.
+//! The configuration file.
 //!
-//! Everything about *how the archive behaves* — the partition interval, the
-//! memory cap, the write-ahead log, flush and compaction thresholds, Parquet
-//! settings, and per-table suppression and retention. Deployment and security
-//! stay in the environment ([`crate::serve`]): where the data lives, what to
-//! listen on, TLS, credentials.
+//! Everything an operator configures: where the data lives, what to listen on,
+//! TLS and credentials (§9), and how the archive behaves — the partition
+//! interval, the memory cap, the write-ahead log, flush and compaction
+//! thresholds, Parquet settings, and per-table suppression and retention.
 //!
-//! The split is deliberate and it removes precedence rules entirely. Nothing is
-//! settable in two places, so there is never a question of which one won.
+//! **`HETIDA_CONFIG` is the only environment variable left.** Everything else
+//! moved here, and a start refuses when a retired variable is still set
+//! ([`crate::serve::retired_in_use`]) rather than ignoring it. One place to
+//! configure means no precedence rules, and it takes passwords out of an
+//! environment that `ps` exposes to every user on the host.
 //!
 //! # A missing file is defaults; a broken one is a refusal
 //!
@@ -50,24 +52,34 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::archive::ArchiveConfig;
+use crate::auth::TableSet;
 use crate::catalog::TableConfig;
 use crate::clock::Micros;
 use crate::compact::CompactConfig;
 use crate::flush::FlushConfig;
 use crate::parquet::ParquetConfig;
 use crate::partition::PartitionInterval;
+use crate::serve::{AuthConfig, ConfigError, TransportConfig, UserSpec};
 use crate::suppression::SuppressionConfig;
 use crate::wal::WalConfig;
 
 /// Path to the configuration file, if one is used.
+///
+/// The only environment variable the server reads. Everything else moved into
+/// the file it names.
 pub const CONFIG_VAR: &str = "HETIDA_CONFIG";
+
+/// Where the archive lives, unless the file says otherwise.
+pub const DEFAULT_DATA_DIR: &str = "hetida-data";
+/// Address to serve on, unless the file says otherwise.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:50051";
 
 /// Why a configuration file could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -119,10 +131,16 @@ impl Default for Ticks {
     }
 }
 
-/// The archive configuration, as a file describes it.
+/// The configuration, as a file describes it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FileConfig {
+    /// Root of the archive: logs, Parquet and instance metadata.
+    data_dir: Option<PathBuf>,
+    /// The listener and its TLS identity (§9).
+    server: ServerSection,
+    /// Who may do what (§9).
+    auth: AuthSection,
     /// Layout granularity, validated against the instance metadata (§11).
     partition_interval: Option<Interval>,
     /// Hard cap on memtable bytes before ingestion is refused (§7).
@@ -137,6 +155,59 @@ pub struct FileConfig {
     table_defaults: TableSection,
     /// Per-table overrides (§6).
     tables: BTreeMap<String, TableSection>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ServerSection {
+    listen: Option<String>,
+    tls_certificate: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    allow_plaintext: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct AuthSection {
+    allow_anonymous: bool,
+    users: Vec<UserEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct UserEntry {
+    name: String,
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    read: Tables,
+    write: Tables,
+}
+
+/// A grant's table list, written as `["a", "b"]`, `"a"`, or `"*"` for all.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum Tables {
+    /// A single name, or `"*"`.
+    One(String),
+    /// Several names; `"*"` anywhere means all.
+    Many(Vec<String>),
+    /// Absent — no grant. A grant nobody wrote down is not a grant.
+    #[default]
+    None,
+}
+
+impl Tables {
+    fn resolve(&self) -> TableSet {
+        let names: Vec<&str> = match self {
+            Self::One(name) => vec![name.as_str()],
+            Self::Many(names) => names.iter().map(String::as_str).collect(),
+            Self::None => Vec::new(),
+        };
+        if names.contains(&"*") {
+            return TableSet::All;
+        }
+        TableSet::named(names.into_iter().filter(|name| !name.is_empty()))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -186,6 +257,47 @@ struct TableSection {
 }
 
 impl FileConfig {
+    /// Where the archive lives.
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR))
+    }
+
+    /// The socket address to serve Arrow Flight on.
+    pub fn listen(&self) -> &str {
+        self.server.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
+    }
+
+    /// How the listener is protected, refusing to guess (§9).
+    pub fn transport(&self) -> Result<TransportConfig, ConfigError> {
+        TransportConfig::resolve(
+            self.server.tls_certificate.as_deref(),
+            self.server.tls_key.as_deref(),
+            self.server.allow_plaintext,
+        )
+    }
+
+    /// The users this file configures, before their passwords are read (§9).
+    pub fn users(&self) -> Vec<UserSpec> {
+        self.auth
+            .users
+            .iter()
+            .map(|entry| UserSpec {
+                name: entry.name.clone(),
+                password: entry.password.clone(),
+                password_file: entry.password_file.clone(),
+                read: entry.read.resolve(),
+                write: entry.write.resolve(),
+            })
+            .collect()
+    }
+
+    /// Who may do what, refusing to guess (§9).
+    pub fn auth(&self) -> Result<AuthConfig, ConfigError> {
+        AuthConfig::resolve(&self.users(), self.auth.allow_anonymous)
+    }
+
     /// Reads the configuration at `path`.
     pub fn load(path: &Path) -> Result<Self, ConfigFileError> {
         let shown = path.display().to_string();
@@ -753,6 +865,144 @@ mod tests {
         assert_eq!(by_name["readings"].retention, Some(90 * DAY));
         assert_eq!(by_name["audit"].retention, None);
         assert_eq!(by_name["audit"].suppression.window, MINUTE);
+    }
+
+    // ---- the server and its credentials (§9) ----
+
+    #[test]
+    fn the_listener_and_data_dir_default_when_the_file_is_silent() {
+        let config = parsed("");
+        assert_eq!(
+            config.data_dir(),
+            std::path::PathBuf::from(DEFAULT_DATA_DIR)
+        );
+        assert_eq!(config.listen(), DEFAULT_LISTEN);
+    }
+
+    #[test]
+    fn the_listener_and_data_dir_come_from_the_file() {
+        let config = parsed(
+            r#"
+            data_dir = "/var/lib/hetida"
+
+            [server]
+            listen = "0.0.0.0:50051"
+            allow_plaintext = true
+            "#,
+        );
+
+        assert_eq!(
+            config.data_dir(),
+            std::path::PathBuf::from("/var/lib/hetida")
+        );
+        assert_eq!(config.listen(), "0.0.0.0:50051");
+        assert_eq!(
+            config.transport(),
+            Ok(crate::serve::TransportConfig::Plaintext)
+        );
+    }
+
+    /// §9: the refusal survives the move. An unconfigured listener must not
+    /// quietly serve in the clear because the setting now lives in a file.
+    #[test]
+    fn an_unconfigured_listener_still_refuses_to_start() {
+        assert!(parsed("").transport().is_err());
+    }
+
+    #[test]
+    fn a_tls_identity_is_read_from_the_file() {
+        let config = parsed(
+            r#"
+            [server]
+            tls_certificate = "/etc/hetida/chain.pem"
+            tls_key = "/etc/hetida/key.pem"
+            "#,
+        );
+
+        assert_eq!(
+            config.transport(),
+            Ok(crate::serve::TransportConfig::Tls {
+                certificate: std::path::PathBuf::from("/etc/hetida/chain.pem"),
+                key: std::path::PathBuf::from("/etc/hetida/key.pem"),
+            })
+        );
+    }
+
+    /// §9: per-table grants, written as a list, a bare name, or `"*"`.
+    #[test]
+    fn grants_are_read_in_every_form_they_may_be_written() {
+        let config = parsed(
+            r#"
+            [[auth.users]]
+            name = "admin"
+            password = "s3cret"
+            read = "*"
+            write = ["*"]
+
+            [[auth.users]]
+            name = "analyst"
+            password = "hunter2"
+            read = ["readings", "events"]
+
+            [[auth.users]]
+            name = "one"
+            password = "pw"
+            read = "readings"
+            "#,
+        );
+        let users = config.users();
+
+        assert_eq!(users[0].read, TableSet::All, "a bare `*`");
+        assert_eq!(users[0].write, TableSet::All, "or `*` in a list");
+        assert_eq!(users[1].read, TableSet::named(["readings", "events"]));
+        assert_eq!(
+            users[1].write,
+            TableSet::default(),
+            "a clause nobody wrote is not a grant"
+        );
+        assert_eq!(users[2].read, TableSet::named(["readings"]));
+    }
+
+    /// §9: the whole point of the move — a password can stay out of the
+    /// configuration entirely.
+    #[test]
+    fn a_user_may_name_a_password_file_instead_of_a_password() {
+        let config = parsed(
+            r#"
+            [[auth.users]]
+            name = "ingest"
+            password_file = "/run/secrets/ingest"
+            write = ["readings"]
+            "#,
+        );
+        let users = config.users();
+
+        assert_eq!(users[0].password, None);
+        assert_eq!(
+            users[0].password_file,
+            Some(std::path::PathBuf::from("/run/secrets/ingest"))
+        );
+        assert!(
+            !crate::serve::AuthConfig::holds_literal_secrets(&users),
+            "nothing secret is in the file, so nothing needs protecting in it"
+        );
+    }
+
+    #[test]
+    fn anonymous_access_is_still_something_that_must_be_asked_for() {
+        assert!(parsed("").auth().is_err());
+        assert!(matches!(
+            parsed("[auth]\nallow_anonymous = true").auth(),
+            Ok(crate::serve::AuthConfig::Anonymous)
+        ));
+    }
+
+    #[test]
+    fn a_misspelled_user_key_is_refused() {
+        assert!(
+            FileConfig::parse("[[auth.users]]\nname = \"a\"\npassword = \"b\"\nreed = [\"x\"]")
+                .is_err()
+        );
     }
 
     #[test]

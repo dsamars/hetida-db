@@ -53,8 +53,26 @@ struct Served {
     clock: Arc<TestClock>,
 }
 
-/// Serves an archive behind the real interceptor, on an ephemeral port.
+/// Serves an archive behind the real interceptor, with the built-in test users.
 async fn serve() -> Served {
+    serve_with(Arc::new(
+        StaticCredentials::new()
+            .with_user("admin", "s3cret", Grants::all())
+            .with_user("reader", "hunter2", Grants::read_only(["readings"]))
+            .with_user(
+                "events-only",
+                "pw",
+                Grants {
+                    read: TableSet::named(["events"]),
+                    write: TableSet::named(["events"]),
+                },
+            ),
+    ))
+    .await
+}
+
+/// Serves an archive behind the real interceptor, on an ephemeral port.
+async fn serve_with(credentials: Arc<StaticCredentials>) -> Served {
     let storage = InMemoryStorage::new();
     let clock = Arc::new(TestClock::new(AUGUST));
     let archive = Arc::new(
@@ -72,19 +90,6 @@ async fn serve() -> Served {
         .expect("archive"),
     );
 
-    let credentials = Arc::new(
-        StaticCredentials::new()
-            .with_user("admin", "s3cret", Grants::all())
-            .with_user("reader", "hunter2", Grants::read_only(["readings"]))
-            .with_user(
-                "events-only",
-                "pw",
-                Grants {
-                    read: TableSet::named(["events"]),
-                    write: TableSet::named(["events"]),
-                },
-            ),
-    );
     let issuer = Arc::new(TokenIssuer::new(
         credentials,
         Arc::new(TestTokens::default()),
@@ -435,4 +440,59 @@ fn the_credential_store_can_be_implemented_from_outside() {
 
     assert!(principal.may_read("readings").is_ok());
     assert!(principal.may_write("readings").is_err());
+}
+
+/// §9: the credentials path end to end from a configuration file — including a
+/// password kept in a file of its own, which is why they moved out of the
+/// environment at all.
+#[tokio::test]
+async fn a_password_file_named_in_the_configuration_admits_a_client() {
+    use hetida_db::config::FileConfig;
+    use hetida_db::serve::AuthConfig;
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let secret = directory.path().join("ingest.secret");
+    std::fs::write(&secret, "s3cret\n").expect("write");
+
+    let file = FileConfig::parse(&format!(
+        r#"
+        [server]
+        allow_plaintext = true
+
+        [[auth.users]]
+        name = "ingest"
+        password_file = "{}"
+        write = ["readings"]
+        read = ["readings"]
+        "#,
+        secret.display()
+    ))
+    .expect("configuration");
+
+    let AuthConfig::Users(credentials) = file.auth().expect("resolved") else {
+        panic!("expected users");
+    };
+
+    let mut served = serve_with(credentials).await;
+    let token = served
+        .handshake("ingest", "s3cret")
+        .await
+        .expect("the secret from the file must authenticate");
+
+    assert_eq!(
+        served
+            .write("readings", &[(1, AUGUST, 1.5)], Some(&token))
+            .await
+            .expect("granted"),
+        1
+    );
+    assert_eq!(
+        served
+            .write("events", &[(1, AUGUST, 1.5)], Some(&token))
+            .await
+            .expect_err("must be refused")
+            .code(),
+        tonic::Code::PermissionDenied,
+        "the grants from the file must be the ones enforced"
+    );
 }

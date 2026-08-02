@@ -19,29 +19,39 @@ use hetida_db::archive::Archive;
 use hetida_db::auth::{DEFAULT_TOKEN_TTL, SystemTokens, TokenIssuer};
 use hetida_db::clock::{Clock, SystemClock};
 use hetida_db::compact::{Compactor, partition_dirs};
-use hetida_db::config::FileConfig;
+use hetida_db::config::{CONFIG_VAR, FileConfig};
 use hetida_db::flight::BearerInterceptor;
 use hetida_db::flight::HetidaFlightService;
 use hetida_db::flush::{FlushScheduler, Flusher};
 use hetida_db::retention::Reaper;
-use hetida_db::serve::{AuthConfig, TransportConfig};
+use hetida_db::serve::{
+    AuthConfig, TransportConfig, Warning, readable_beyond_owner, retired_in_use,
+};
 use hetida_db::storage::FileStorage;
-
-/// Where the archive lives, unless `HETIDA_DATA_DIR` says otherwise.
-const DEFAULT_DATA_DIR: &str = "hetida-data";
-/// Address to serve on, unless `HETIDA_LISTEN` says otherwise.
-const DEFAULT_LISTEN: &str = "127.0.0.1:50051";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let data_dir = std::env::var("HETIDA_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_owned());
-    let listen = std::env::var("HETIDA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
+    // §9: a variable that used to work and is now ignored would deploy a server
+    // listening somewhere else, or with its credentials silently dropped. Say so
+    // and stop, rather than start something the operator did not ask for.
+    let retired = retired_in_use(|name| std::env::var(name).ok());
+    if !retired.is_empty() {
+        for line in &retired {
+            eprintln!("hetida-db: {line}");
+        }
+        anyhow::bail!(
+            "{} retired environment variable(s) are still set; \
+             everything moved into the file {CONFIG_VAR} names",
+            retired.len()
+        );
+    }
 
-    // How the archive behaves comes from the file; where it is deployed and how
-    // it is secured comes from the environment. Nothing is settable in both, so
-    // there is never a question of which one won.
+    // One place to configure, so there are no precedence rules.
     let file = FileConfig::resolve(|name| std::env::var(name).ok())
-        .context("the archive configuration could not be used")?;
+        .context("the configuration could not be used")?;
+
+    let data_dir = file.data_dir().display().to_string();
+    let listen = file.listen().to_owned();
     let config = file.archive();
     let parquet = file.parquet();
     let ticks = file.ticks();
@@ -228,10 +238,20 @@ async fn main() -> anyhow::Result<()> {
 
     // §9: neither of these guesses. Serving in the clear, or serving anyone at
     // all, is a decision an operator has to write down.
-    let transport = TransportConfig::resolve(|name| std::env::var(name).ok())
-        .context("the listener is not configured")?;
-    let auth = AuthConfig::resolve(|name| std::env::var(name).ok())
-        .context("authorization is not configured")?;
+    let transport = file.transport().context("the listener is not configured")?;
+    let auth = file.auth().context("authorization is not configured")?;
+
+    // A configuration holding literal passwords that anyone on the host can read
+    // is worth saying out loud, but not worth refusing over — see `serve`.
+    if AuthConfig::holds_literal_secrets(&file.users())
+        && let Some(path) = std::env::var(CONFIG_VAR).ok().map(PathBuf::from)
+        && let Some(mode) = readable_beyond_owner(&path)
+    {
+        eprintln!(
+            "hetida-db: {}",
+            Warning::WorldReadableSecrets { path, mode }
+        );
+    }
 
     let mut server = Server::builder();
     match &transport {

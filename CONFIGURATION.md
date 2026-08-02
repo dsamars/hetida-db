@@ -7,143 +7,17 @@ Every setting hetida-db has, where it is set, and what choosing it wrong costs.
 Section references (§n) point at the decision in [`ARCHITECTURE.md`](ARCHITECTURE.md)
 that the setting serves.
 
-Settings fall into three groups, and the difference matters:
+Almost everything is in one file, and the exceptions are worth knowing:
 
 | Group | Set by | Changeable |
 |---|---|---|
-| [Environment variables](#environment-variables) | the operator, at launch | every start |
-| [The configuration file](#the-configuration-file) | `HETIDA_CONFIG` | every start |
+| [The configuration file](#the-configuration-file) | the path in `HETIDA_CONFIG` | every start |
+| [The environment](#the-environment) | `HETIDA_CONFIG`, and nothing else | every start |
 | [Instance metadata](#instance-metadata) | recorded at initialisation | never, once data exists |
 
-The split between the first two is deliberate: **the environment says where the
-archive is deployed and how it is secured, the file says how it behaves.**
-Nothing is settable in both, so there is never a question of which one won.
-
-## Environment variables
-
-Deployment and security. Everything about the archive's behaviour is in
-[the file](#the-configuration-file).
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `HETIDA_DATA_DIR` | `hetida-data` | Root of the archive: logs, Parquet and instance metadata |
-| `HETIDA_LISTEN` | `127.0.0.1:50051` | Socket address to serve Arrow Flight on |
-| `HETIDA_CONFIG` | — | Path to the configuration file; unset means the defaults |
-| `HETIDA_TLS_CERT` | — | Path to a PEM certificate chain (§9) |
-| `HETIDA_TLS_KEY` | — | Path to the matching PEM private key (§9) |
-| `HETIDA_ALLOW_PLAINTEXT` | — | `1` to serve without TLS, deliberately |
-| `HETIDA_USERS` | — | Credentials and per-table grants (§9) |
-| `HETIDA_ALLOW_ANONYMOUS` | — | `1` to serve without authentication, deliberately |
-
-### `HETIDA_DATA_DIR`
-
-Everything the archive owns lives beneath it:
-
-```
-hetida-data/
-  instance.meta          the recorded partition interval (§11)
-  catalog/               registrations and table schemas — never reclaimed (§4, §10)
-  wal/                   the data log — reclaimed once its rows reach Parquet (§4)
-  data/<table>/year=…/…  partitioned Parquet, one directory per partition (§11)
-```
-
-The two logs are not interchangeable and both belong in every backup. Without
-`catalog/` the Parquet files cannot be interpreted: `metric_id` is a surrogate,
-and the mapping back to a name and its labels exists nowhere else (§10).
-
-### `HETIDA_LISTEN`
-
-Any socket address. Bind to a loopback address unless the listener is protected
-— see the next two settings.
-
-### `HETIDA_TLS_CERT`, `HETIDA_TLS_KEY`, `HETIDA_ALLOW_PLAINTEXT`
-
-**The server refuses to start unless one of these is decided.** A bearer token
-travels in an HTTP header; without TLS anyone on the path can read it and replay
-it for as long as it lives. That is not a risk a default can weigh, so it is not
-one the binary guesses at.
-
-Either set both halves of a TLS identity:
-
-```sh
-HETIDA_TLS_CERT=/etc/hetida/chain.pem HETIDA_TLS_KEY=/etc/hetida/key.pem
-```
-
-or decline TLS in writing:
-
-```sh
-HETIDA_ALLOW_PLAINTEXT=1
-```
-
-Setting only one half of the identity is a mistake rather than a request for
-plaintext, and is refused. Affirmative values are `1`, `true` and `yes`, in any
-case; anything else — including `0` and `false` — is not consent.
-
-TLS is terminated by `tonic` using `rustls` with the `ring` backend, chosen over
-`aws-lc` because it builds without `cmake` or a C toolchain.
-
-### `HETIDA_USERS` and `HETIDA_ALLOW_ANONYMOUS`
-
-**The server also refuses to start unless authorization is decided.** Grants are
-per table and per direction (§9); table level is the natural granularity because
-a table is what a `do_put` descriptor names and what a `do_get` query selects
-from.
-
-One entry per user, separated by `;`:
-
-```
-name:password:read=<tables>:write=<tables>
-```
-
-- `<tables>` is a comma-separated list, or `*` for every table — including tables
-  that do not exist yet, since a table appears when a client first writes to it (§6).
-- A missing `read` or `write` clause grants nothing. A grant nobody wrote down is
-  not a grant.
-- A malformed entry refuses the **whole** configuration rather than being skipped,
-  so a typo cannot silently leave one user unauthenticated while the rest works.
-
-```sh
-HETIDA_USERS='ingest:$PW1:write=readings,events;analyst:$PW2:read=readings'
-```
-
-Or decline authentication in writing, which grants every caller everything:
-
-```sh
-HETIDA_ALLOW_ANONYMOUS=1
-```
-
-What a grant covers:
-
-- **Write** is checked against the table in the `do_put` descriptor path, once
-  per call — never per message. One stream carries thousands of `RecordBatch`es
-  behind that single check, and repeating it would put credential validation in
-  the ingestion hot path (§9).
-- **Read** is checked against every table the *planned* query touches, so a view,
-  a subquery or a join cannot reach round a grant. A query naming several tables
-  needs every one of them.
-- `<table>`, `"<table>$history"` and the internal `"<table>$raw"` are three views
-  of one table's rows and share one grant.
-- The registry catalog tables `hetida_series` and `hetida_labels` are ordinary
-  table names and need granting by name. Series names and label values are
-  metadata, but they are still the archive's data.
-- `get_schema` and `get_flight_info` need the same read grant the rows do, or a
-  schema would describe a table to a client that may not see inside it.
-
-Credentials live in the environment rather than in the configuration file, which
-is a deliberate split but not an ideal one: an environment variable is visible in
-`ps` and in a process's `/proc` entry. Moving them into the file — or behind one
-of the backends below — is the obvious next step.
-
-Credentials are checked through a `CredentialStore` trait; the static
-configuration above is the v1 backend. OIDC/JWT and mTLS client certificates are
-later backends, which is why authentication answers with a principal rather than
-a verdict — a backend that learns grants from the credential itself fits without
-changing anything above it (§9).
-
-Tokens are 32 random bytes from the operating system, hex encoded, valid for
-**12 hours**, and held in memory: a restart invalidates every one of them. That
-is correct — the archive's durable state is its data, not its sessions, and a
-client already has to handle re-handshaking.
+**One place to configure means no precedence rules.** Nothing is settable twice,
+so there is never a question of which setting won — and a variable that used to
+work but no longer does is a refusal to start, not a silent default.
 
 ## The configuration file
 
@@ -158,6 +32,20 @@ kind of wrong.
 (Instance metadata takes the opposite rule, for the opposite reason — it is
 machine-written, and tolerating unknown keys is what lets an older build read a
 newer one's file.)
+
+### What `data_dir` holds
+
+```
+hetida-data/
+  instance.meta          the recorded partition interval (§11)
+  catalog/               registrations and table schemas — never reclaimed (§4, §10)
+  wal/                   the data log — reclaimed once its rows reach Parquet (§4)
+  data/<table>/year=…/…  partitioned Parquet, one directory per partition (§11)
+```
+
+The two logs are not interchangeable and both belong in every backup. Without
+`catalog/` the Parquet files cannot be interpreted: `metric_id` is a surrogate,
+and the mapping back to a name and its labels exists nowhere else (§10).
 
 ### Units
 
@@ -179,6 +67,21 @@ Case does not matter and a space before the unit is fine, so `"512 MiB"` and
 Every key is optional. This is what the archive does if the file is absent.
 
 ```toml
+# Root of the archive: logs, Parquet and instance metadata.
+data_dir = "hetida-data"
+
+[server]
+listen = "127.0.0.1:50051"
+# A PEM certificate chain and private key. Both together, or neither with
+# allow_plaintext — see "Deciding TLS and authorization" below.
+# tls_certificate = "/etc/hetida/chain.pem"
+# tls_key = "/etc/hetida/key.pem"
+allow_plaintext = false
+
+[auth]
+allow_anonymous = false
+# users = [] — see "Users and grants" below.
+
 # Layout granularity, validated against instance.meta (§11). Immutable once
 # data exists — see below.
 partition_interval = "month"
@@ -245,6 +148,121 @@ suppression_max_entries = 2000000
 # retention is unset: keep forever. Retention deletes, so it is never inferred.
 ```
 
+### Deciding TLS and authorization
+
+**The server refuses to start until both are decided.** A bearer token travels
+in an HTTP header; without TLS anyone on the path can read it and replay it for
+as long as it lives. And an archive serving `do_put` to anyone who can reach the
+port is a defensible choice on a private network and a disaster anywhere else.
+Neither is a risk a default can weigh.
+
+Either give the listener a TLS identity:
+
+```toml
+[server]
+tls_certificate = "/etc/hetida/chain.pem"
+tls_key = "/etc/hetida/key.pem"
+```
+
+or decline TLS in writing:
+
+```toml
+[server]
+allow_plaintext = true
+```
+
+Setting only one half of the identity is a mistake rather than a request for
+plaintext, and is refused. So is setting an identity *and* `allow_plaintext`:
+both cannot be meant, and choosing one would be exactly the guess this refuses
+to make.
+
+TLS is terminated by `tonic` using `rustls` with the `ring` backend, chosen over
+`aws-lc` because it builds without `cmake` or a C toolchain.
+
+### Users and grants
+
+```toml
+[[auth.users]]
+name = "ingest"
+password_file = "/run/secrets/ingest"
+write = ["readings", "events"]
+
+[[auth.users]]
+name = "analyst"
+password = "hunter2"
+read = ["readings"]
+
+[[auth.users]]
+name = "admin"
+password_file = "/run/secrets/admin"
+read = "*"
+write = ["*"]
+```
+
+| Key | Meaning |
+|---|---|
+| `name` | The name the client authenticates as |
+| `password` | The password, literally — see the warning below |
+| `password_file` | A file holding it instead, so it is not in this file at all |
+| `read` / `write` | Tables granted: a list, a bare name, or `"*"` for every table |
+
+- Exactly one of `password` and `password_file` per user. Both, or neither, is
+  refused rather than resolved.
+- A `password_file` is read **at startup**, so an unreadable secret fails the
+  start rather than the first handshake that needs it hours later. One trailing
+  newline is stripped, because that is what `echo` and every secret-mounting
+  tool leaves behind; nothing else is, since a password may legitimately begin
+  or end with a space.
+- `"*"` grants every table, **including tables that do not exist yet** — a table
+  appears when a client first writes to it (§6).
+- A missing `read` or `write` grants nothing. A grant nobody wrote down is not a
+  grant.
+
+Or decline authentication entirely, which grants every caller everything:
+
+```toml
+[auth]
+allow_anonymous = true
+```
+
+Listing users *and* allowing anonymous access is refused: anonymous access
+grants everything, so the grants would mean nothing.
+
+> **Prefer `password_file`.** A literal password makes the configuration a
+> secret, and a configuration is usually not treated as one. A start that finds
+> literal passwords in a file readable beyond its owner says so — but it is a
+> warning, not a refusal: the permission bit is a hygiene signal, not an
+> undecided policy, and failing a deploy over an ownership arrangement this
+> process cannot fully judge would be the wrong trade.
+
+What a grant covers:
+
+- **Write** is checked against the table in the `do_put` descriptor path, once
+  per call — never per message. One stream carries thousands of `RecordBatch`es
+  behind that single check, and repeating it would put credential validation in
+  the ingestion hot path (§9).
+- **Read** is checked against every table the *planned* query touches, so a view,
+  a subquery or a join cannot reach round a grant. A query naming several tables
+  needs every one of them.
+- `<table>`, `"<table>$history"` and the internal `"<table>$raw"` are three views
+  of one table's rows and share one grant.
+- The registry catalog tables `hetida_series` and `hetida_labels` are ordinary
+  table names and need granting by name. Series names and label values are
+  metadata, but they are still the archive's data.
+- `get_schema` and `get_flight_info` need the same read grant the rows do, or a
+  schema would describe a table to a client that may not see inside it.
+
+Credentials are checked through a `CredentialStore` trait; the static
+configuration above is the v1 backend. OIDC/JWT and mTLS client certificates are
+later backends, which is why authentication answers with a principal rather than
+a verdict — a backend that learns the grants from the credential itself fits
+without changing anything above it (§9).
+
+Tokens are 32 random bytes from the operating system, hex encoded, valid for
+**12 hours**, and held in memory: a restart invalidates every one of them. That
+is correct — the archive's durable state is its data, not its sessions, and a
+client already has to handle re-handshaking.
+
 ### Per-table settings
 
 A `[tables.<name>]` section starts from `[table_defaults]` and overrides only
@@ -290,6 +308,34 @@ Two things about retention are easy to get wrong:
 Ingesting into a partition the reaper could already drop is refused with
 `FAILED_PRECONDITION`. A row behind the horizon that shares a partition with
 live data is still accepted, because that partition is kept and served.
+
+## The environment
+
+One variable.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HETIDA_CONFIG` | — | Path to the configuration file; unset means the defaults |
+
+Everything else lives in the file it names. That is one place to configure, so
+there are no precedence rules to get wrong — and it keeps passwords out of an
+environment that `ps` and `/proc` expose to every user on the host.
+
+### Variables that were retired
+
+A start **refuses** while any of these is still set, and says where it moved.
+Ignoring a variable that used to work would deploy a server listening somewhere
+else, or with its credentials silently dropped.
+
+| Retired | Now |
+|---|---|
+| `HETIDA_DATA_DIR` | `data_dir` |
+| `HETIDA_LISTEN` | `[server] listen` |
+| `HETIDA_TLS_CERT` | `[server] tls_certificate` |
+| `HETIDA_TLS_KEY` | `[server] tls_key` |
+| `HETIDA_ALLOW_PLAINTEXT` | `[server] allow_plaintext` |
+| `HETIDA_USERS` | `[[auth.users]]` entries |
+| `HETIDA_ALLOW_ANONYMOUS` | `[auth] allow_anonymous` |
 
 ## Instance metadata
 

@@ -13,54 +13,59 @@ The archive is **bitemporal**: `timestamp` is valid time, `system_time`/`seq` is
 
 ```sh
 cargo build --release
-
-HETIDA_DATA_DIR=/var/lib/hetida \
-HETIDA_LISTEN=0.0.0.0:50051 \
-HETIDA_TLS_CERT=/etc/hetida/chain.pem \
-HETIDA_TLS_KEY=/etc/hetida/key.pem \
-HETIDA_USERS='ingest:$PW1:write=readings;analyst:$PW2:read=readings' \
-  ./target/release/hetida-db
+HETIDA_CONFIG=/etc/hetida/hetida.toml ./target/release/hetida-db
 ```
 
-**The server refuses to start until TLS and authorization are decided.** A bearer token travels in a header, and an archive serving `do_put` to anyone who can reach the port is a defensible choice on a private network and a disaster anywhere else — neither is something a default can weigh. To decline either one, say so:
-
-```sh
-HETIDA_ALLOW_PLAINTEXT=1 HETIDA_ALLOW_ANONYMOUS=1 ./target/release/hetida-db
-```
-
-Full reference: [`CONFIGURATION.md`](CONFIGURATION.md).
-
-## Configuration at a glance
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `HETIDA_DATA_DIR` | `hetida-data` | Root of the archive: logs, Parquet, instance metadata |
-| `HETIDA_LISTEN` | `127.0.0.1:50051` | Arrow Flight listener |
-| `HETIDA_TLS_CERT` / `HETIDA_TLS_KEY` | — | PEM certificate chain and private key |
-| `HETIDA_ALLOW_PLAINTEXT` | — | `1` to serve without TLS, deliberately |
-| `HETIDA_USERS` | — | `name:password:read=a,b:write=c`, `;`-separated |
-| `HETIDA_ALLOW_ANONYMOUS` | — | `1` to serve without authentication, deliberately |
-| `HETIDA_CONFIG` | — | Path to the configuration file; unset means the defaults |
-
-The environment says where the archive is deployed and how it is secured; the file says how it behaves. Nothing is settable in both.
+`HETIDA_CONFIG` is the only environment variable. Everything else lives in the
+file it names — one place to configure, so there are no precedence rules, and
+passwords stay out of an environment that `ps` exposes to every user on the host.
+A start refuses while a retired variable is still set, and says where it moved.
 
 ```toml
-# hetida.toml — every key optional, shown here at a non-default setting
-partition_interval = "day"
-max_memtable_bytes = "2GiB"
+data_dir = "/var/lib/hetida"
 
-[flush]
-max_age = "2m"
+[server]
+listen = "0.0.0.0:50051"
+tls_certificate = "/etc/hetida/chain.pem"
+tls_key = "/etc/hetida/key.pem"
+
+[[auth.users]]
+name = "ingest"
+password_file = "/run/secrets/ingest"   # kept out of the configuration entirely
+write = ["readings"]
+
+[[auth.users]]
+name = "analyst"
+password_file = "/run/secrets/analyst"
+read = ["readings"]
+
+[tables.readings]
+retention = "90d"        # dropped by whole partitions, by event time (§8)
 
 [tables.forecast]
 suppression_window = "1h"   # a job recomputing its horizon hourly (§1)
-retention = "400d"          # dropped by whole partitions, by event time (§8)
 ```
 
-Two things are worth knowing before the first start:
+**The server refuses to start until TLS and authorization are decided.** A bearer
+token travels in a header, and an archive serving `do_put` to anyone who can
+reach the port is a defensible choice on a private network and a disaster
+anywhere else — neither is something a default can weigh. To decline either one,
+say so:
+
+```toml
+[server]
+allow_plaintext = true
+
+[auth]
+allow_anonymous = true
+```
+
+Full reference: [`CONFIGURATION.md`](CONFIGURATION.md). Three things are worth
+knowing before the first start:
 
 - **The partition interval is immutable once data exists.** It defaults to `month`, is recorded in `instance.meta` at initialisation, and a later start that disagrees is a startup error rather than a silent second layout. It also bounds retention, since whole partitions are dropped — choose the two together.
-- **A named configuration file that cannot be read stops the start, and unknown keys are rejected.** A file is written by hand, and a misspelled `retention` that is silently ignored is the costliest failure there is to find.
+- **A named file that cannot be read stops the start, and unknown keys are rejected.** The file is written by hand, and a misspelled `retention` that is silently ignored is the costliest failure there is to find.
+- **Prefer `password_file` to `password`.** A literal password makes the configuration a secret, and a configuration is usually not treated as one.
 
 ## Using it
 
@@ -78,7 +83,7 @@ The observation point travels in the `Ticket` beside the SQL as `hetida.v1.Query
 
 ## Documentation
 
-- [`CONFIGURATION.md`](CONFIGURATION.md) — every setting, what it costs, and what is not yet reachable
+- [`CONFIGURATION.md`](CONFIGURATION.md) — every setting and what choosing it wrong costs
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design and the settled design decisions
 - [`CLAUDE.md`](CLAUDE.md) — performance, quality and documentation rules for contributors
 - [`tasks.md`](tasks.md) — phased implementation plan
