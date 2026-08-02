@@ -27,6 +27,7 @@
 
 pub mod active;
 pub mod clock;
+pub mod instance;
 pub mod memtable;
 pub mod partition;
 pub mod registry;

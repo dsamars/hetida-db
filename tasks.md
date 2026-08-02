@@ -33,8 +33,8 @@ Every task is executed test-first: its tests are written and failing before any 
 
 ## Phase 2: Parquet Storage & Archiver
 - [ ] Implement Parquet writer with ZSTD compression and explicit Min/Max column index generation, including `system_time` so old observation points can skip whole row groups (§1).
-- [ ] Implement the parameterised Hive-style partitioner for the `hour`/`day`/`month`/`year` intervals, taking the interval as an argument rather than a global (§11).
-- [ ] Persist the partition interval in the instance metadata at initialisation and validate it against the on-disk layout at startup, refusing to start on a mismatch (§11).
+- [x] Implement the parameterised Hive-style partitioner for the `hour`/`day`/`month`/`year` intervals, taking the interval as an argument rather than a global (§11). *Pulled forward: partition routing in Phase 1 cannot derive a path without it.*
+- [x] Persist the partition interval in the instance metadata at initialisation and validate it against the on-disk layout at startup, refusing to start on a mismatch (§11). *Also refuses when partitions exist but the metadata is gone, since the layout cannot then be inferred.*
 - [ ] Build background flusher transferring frozen `MemTable`s to Parquet, triggered per partition by size cap or max age — whichever fires first — writing `part-<seq>.parquet` sorted by `(metric_id, timestamp, seq)` with all versions preserved (§1, §2, §3).
 - [ ] Build background compactor merging and re-sorting a partition's files into `(metric_id, timestamp, seq)` order once file count or total size crosses a threshold, emitting files of a configurable target size with disjoint `(metric_id, timestamp)` ranges. It must never drop a version (§1, §3, §11).
 - [ ] Implement per-table retention configuration and a background reaper dropping whole partition directories once their interval is entirely past the cutoff, by event time (§8).

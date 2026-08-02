@@ -66,7 +66,12 @@ pub trait Storage: fmt::Debug + Send + Sync {
     /// Reads an object in full.
     fn read(&self, path: &Path) -> StorageResult<Vec<u8>>;
 
-    /// Lists objects directly beneath `prefix`, sorted by path.
+    /// Lists entries directly beneath `prefix`, sorted by path.
+    ///
+    /// Directory semantics, as `read_dir` has them: an object nested deeper is
+    /// reported as the directory containing it. A caller can therefore tell an
+    /// empty prefix from a populated one without walking the whole tree, which
+    /// is what the startup layout check needs (§11).
     ///
     /// A missing prefix lists empty rather than failing: an archive with no
     /// WAL segments yet is a normal state, not an error.
@@ -167,13 +172,22 @@ impl Storage for InMemoryStorage {
     }
 
     fn list(&self, prefix: &Path) -> StorageResult<Vec<PathBuf>> {
-        Ok(self
+        // Mirrors `read_dir`: an object nested deeper appears as the directory
+        // that contains it, not as itself and not as nothing. A flat store that
+        // reported only direct children would make a nested layout invisible
+        // here and visible in production — the one thing this double must not do.
+        let mut listed: Vec<PathBuf> = self
             .lock()
             .objects
             .keys()
-            .filter(|path| path.parent() == Some(prefix))
-            .cloned()
-            .collect())
+            .filter_map(|path| {
+                let below = path.strip_prefix(prefix).ok()?;
+                Some(prefix.join(below.components().next()?))
+            })
+            .collect();
+
+        listed.dedup();
+        Ok(listed)
     }
 
     fn remove(&self, path: &Path) -> StorageResult<()> {
@@ -425,6 +439,53 @@ mod tests {
             listed,
             vec![PathBuf::from("wal/000001"), PathBuf::from("wal/000002")]
         );
+    }
+
+    /// The double has to answer like `read_dir`, or a nested layout would be
+    /// invisible under test and present in production. The startup layout check
+    /// (§11) rests on exactly this.
+    #[test]
+    fn list_reports_a_nested_object_as_the_directory_holding_it() {
+        let storage = InMemoryStorage::new();
+        for name in [
+            "data/year=2026/month=08/part-0.parquet",
+            "data/year=2026/month=09/part-0.parquet",
+            "data/year=2027/month=01/part-0.parquet",
+        ] {
+            storage
+                .open_append(Path::new(name))
+                .unwrap()
+                .sync()
+                .unwrap();
+        }
+
+        assert_eq!(
+            storage.list(Path::new("data")).unwrap(),
+            vec![
+                PathBuf::from("data/year=2026"),
+                PathBuf::from("data/year=2027")
+            ],
+            "each year must appear once, however many files sit below it"
+        );
+        assert_eq!(
+            storage.list(Path::new("data/year=2026")).unwrap(),
+            vec![
+                PathBuf::from("data/year=2026/month=08"),
+                PathBuf::from("data/year=2026/month=09")
+            ]
+        );
+    }
+
+    #[test]
+    fn list_of_an_unpopulated_prefix_is_empty() {
+        let storage = InMemoryStorage::new();
+        storage
+            .open_append(Path::new("wal/000001"))
+            .unwrap()
+            .sync()
+            .unwrap();
+
+        assert!(storage.list(Path::new("data")).unwrap().is_empty());
     }
 
     #[test]
