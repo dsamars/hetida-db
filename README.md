@@ -7,15 +7,71 @@ High-performance time-series archiver built on Apache Arrow Flight, Apache Parqu
 
 Clients write and read Arrow `RecordBatch` streams over pure Arrow Flight. Incoming data is made durable in a write-ahead log, buffered in an in-memory table, and archived into date-partitioned Parquet files, which DataFusion queries alongside the not-yet-flushed memory state.
 
+The archive is **bitemporal**: `timestamp` is valid time, `system_time`/`seq` is system time. Many versions of a logical row coexist, nothing is ever overwritten, and a query resolves the newest version at an optional observation point.
+
+## Running
+
+```sh
+cargo build --release
+
+HETIDA_DATA_DIR=/var/lib/hetida \
+HETIDA_LISTEN=0.0.0.0:50051 \
+HETIDA_TLS_CERT=/etc/hetida/chain.pem \
+HETIDA_TLS_KEY=/etc/hetida/key.pem \
+HETIDA_USERS='ingest:$PW1:write=readings;analyst:$PW2:read=readings' \
+  ./target/release/hetida-db
+```
+
+**The server refuses to start until TLS and authorization are decided.** A bearer token travels in a header, and an archive serving `do_put` to anyone who can reach the port is a defensible choice on a private network and a disaster anywhere else — neither is something a default can weigh. To decline either one, say so:
+
+```sh
+HETIDA_ALLOW_PLAINTEXT=1 HETIDA_ALLOW_ANONYMOUS=1 ./target/release/hetida-db
+```
+
+Full reference: [`CONFIGURATION.md`](CONFIGURATION.md).
+
+## Configuration at a glance
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HETIDA_DATA_DIR` | `hetida-data` | Root of the archive: logs, Parquet, instance metadata |
+| `HETIDA_LISTEN` | `127.0.0.1:50051` | Arrow Flight listener |
+| `HETIDA_TLS_CERT` / `HETIDA_TLS_KEY` | — | PEM certificate chain and private key |
+| `HETIDA_ALLOW_PLAINTEXT` | — | `1` to serve without TLS, deliberately |
+| `HETIDA_USERS` | — | `name:password:read=a,b:write=c`, `;`-separated |
+| `HETIDA_ALLOW_ANONYMOUS` | — | `1` to serve without authentication, deliberately |
+
+Two things are worth knowing before the first start:
+
+- **The partition interval is immutable once data exists.** It defaults to `month`, is recorded in `instance.meta` at initialisation, and a later start that disagrees is a startup error rather than a silent second layout. It also bounds retention, since whole partitions are dropped — choose the two together.
+- **Everything else takes a compiled default.** Flush and compaction thresholds, the memory cap, suppression reach and per-table retention are settled in code; only the variables above are reachable from the binary today. `CONFIGURATION.md` documents each default, what it costs, and how to change it by embedding the crate.
+
+## Using it
+
+Clients resolve series names and labels to `u64` ids once through the `register` action and cache them; `do_put` accepts ids only, so no name resolution happens in the hot path.
+
+Each table is queryable three ways:
+
+```sql
+SELECT * FROM readings                          -- resolved at the observation point
+SELECT * FROM "readings$history"                -- every version, system columns exposed
+SELECT * FROM readings WHERE hetida_label('plant', 'a')
+```
+
+The observation point travels in the `Ticket` beside the SQL as `hetida.v1.Query { sql, as_of_micros }`. The control-plane contract is [`proto/hetida.proto`](proto/hetida.proto) — generate from it rather than reimplementing a byte layout.
+
 ## Documentation
 
+- [`CONFIGURATION.md`](CONFIGURATION.md) — every setting, what it costs, and what is not yet reachable
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design and the settled design decisions
 - [`CLAUDE.md`](CLAUDE.md) — performance, quality and documentation rules for contributors
 - [`tasks.md`](tasks.md) — phased implementation plan
 
 ## Status
 
-Early development. No functionality is implemented yet — see `tasks.md`.
+Phases 0–3 are complete: the write path, Parquet archival with compaction and retention, and the query engine with as-of resolution, TLS and per-table authorization. Phase 4 — benchmarks and high-concurrency stress testing — is outstanding; see [`tasks.md`](tasks.md).
+
+Development is strictly test-driven, and `cargo test` and `cargo clippy -- -D warnings` must pass before any task is complete.
 
 ## Author
 
