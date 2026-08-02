@@ -17,16 +17,30 @@
 //! Registration is durable before it answers — the id is in the catalogue log
 //! (§4) by the time the client sees it, so a client that caches an id can rely on
 //! the server still knowing it after a crash.
+//!
+//! # Reading
+//!
+//! A read is a [`Query`] — SQL plus an optional observation point (§1) — carried
+//! as the `cmd` of a `FlightDescriptor` or as a `Ticket`. Both forms hold the
+//! same bytes, so the standard `get_flight_info` → `do_get` flow works without
+//! the server having to remember anything between the two calls: the ticket it
+//! hands back is the request it was given. A client that already knows what it
+//! wants may skip straight to `do_get`.
+//!
+//! Results stream. `do_get` writes batches as DataFusion produces them, and
+//! never collects an answer that has no reason to fit in memory.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow::ipc::writer::IpcWriteOptions;
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::stream::{self, BoxStream};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -34,8 +48,10 @@ use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::archive::{Archive, IngestError};
-use crate::proto::{RegisterRequest, RegisterResponse};
+use crate::proto::{Query, RegisterRequest, RegisterResponse};
+use crate::query::{QueryEngine, QueryError};
 use crate::registry::SeriesKey;
+use crate::storage::Storage;
 
 /// Action type resolving series identities to ids (§10).
 pub const REGISTER_ACTION: &str = "register";
@@ -44,17 +60,29 @@ pub const REGISTER_ACTION: &str = "register";
 #[derive(Debug)]
 pub struct HetidaFlightService {
     archive: Arc<Archive>,
+    engine: Arc<QueryEngine>,
 }
 
 impl HetidaFlightService {
-    /// Serves `archive` over Flight.
-    pub fn new(archive: Arc<Archive>) -> Self {
-        Self { archive }
+    /// Serves `archive` over Flight, reading its Parquet through `storage`.
+    pub fn new(archive: Arc<Archive>, storage: Arc<dyn Storage>) -> Self {
+        Self {
+            engine: Arc::new(QueryEngine::new(Arc::clone(&archive), storage)),
+            archive,
+        }
     }
 
     /// The archive this service serves.
     pub fn archive(&self) -> &Arc<Archive> {
         &self.archive
+    }
+
+    /// The schema a query answers with, planned but not run (§5).
+    async fn schema_for(&self, query: &Query) -> Result<arrow::datatypes::SchemaRef, Status> {
+        self.engine
+            .schema_of(&query.sql, query.as_of_micros)
+            .await
+            .map_err(query_status)
     }
 
     /// Resolves every series in the request, in request order (§10).
@@ -141,6 +169,28 @@ fn ingest_status(error: IngestError) -> Status {
     }
 }
 
+/// The query a `cmd` or a `Ticket` carries (§5).
+fn query_from(payload: &[u8]) -> Result<Query, Status> {
+    let query = Query::decode(payload).map_err(|error| {
+        Status::invalid_argument(format!(
+            "expected a hetida.v1.Query in the descriptor cmd or ticket: {error}"
+        ))
+    })?;
+    if query.sql.trim().is_empty() {
+        return Err(Status::invalid_argument("a query needs SQL"));
+    }
+    Ok(query)
+}
+
+/// Maps a query failure onto the status a client should see.
+///
+/// `INVALID_ARGUMENT` throughout: the SQL is the client's, and every way it can
+/// fail — a syntax error, an unknown table, a type it cannot compare — is a
+/// question the server will never answer, however often it is asked.
+fn query_status(error: QueryError) -> Status {
+    Status::invalid_argument(error.to_string())
+}
+
 /// A stream of one item, which is what an action result is here.
 fn one<T: Send + 'static>(item: T) -> BoxStream<'static, Result<T, Status>> {
     Box::pin(stream::once(async move { Ok(item) }))
@@ -209,13 +259,28 @@ impl FlightService for HetidaFlightService {
         ))
     }
 
+    /// Describes a query and hands back the ticket that runs it (§5).
+    ///
+    /// The ticket *is* the request: the same `cmd` bytes travel back out, so no
+    /// state has to survive between this call and the `do_get` that follows —
+    /// which also means a ticket does not expire, and a client may keep one.
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        Err(Status::unimplemented(
-            "get_flight_info arrives with the query engine (§5)",
-        ))
+        let descriptor = request.into_inner();
+        let query = query_from(&descriptor.cmd)?;
+        let schema = self.schema_for(&query).await?;
+
+        let info = FlightInfo::new()
+            .try_with_schema(schema.as_ref())
+            .map_err(|error| Status::internal(format!("could not encode the schema: {error}")))?
+            .with_endpoint(FlightEndpoint::new().with_ticket(Ticket {
+                ticket: descriptor.cmd.clone(),
+            }))
+            .with_descriptor(descriptor);
+
+        Ok(Response::new(info))
     }
 
     async fn poll_flight_info(
@@ -227,22 +292,41 @@ impl FlightService for HetidaFlightService {
         ))
     }
 
+    /// The schema a query would answer with, without running it (§5).
     async fn get_schema(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented(
-            "get_schema arrives with the query engine (§5)",
-        ))
+        let query = query_from(&request.into_inner().cmd)?;
+        let schema = self.schema_for(&query).await?;
+
+        SchemaAsIpc::new(schema.as_ref(), &IpcWriteOptions::default())
+            .try_into()
+            .map(Response::new)
+            .map_err(|error| Status::internal(format!("could not encode the schema: {error}")))
     }
 
+    /// Runs a query and streams its result as Arrow IPC (§1, §5).
+    ///
+    /// Streamed, not collected: batches go out as DataFusion produces them, so
+    /// the server never holds an answer whose size the client chose.
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented(
-            "do_get arrives with the query engine (§5)",
-        ))
+        let query = query_from(&request.into_inner().ticket)?;
+        let results = self
+            .engine
+            .stream(&query.sql, query.as_of_micros)
+            .await
+            .map_err(query_status)?;
+
+        let batches = results.map_err(|error| FlightError::ExternalError(Box::new(error)));
+        let encoded = FlightDataEncoderBuilder::new()
+            .build(batches)
+            .map_err(|error| Status::internal(error.to_string()));
+
+        Ok(Response::new(Box::pin(encoded)))
     }
 
     /// Ingests a stream of `RecordBatch` into the table the descriptor names
@@ -346,7 +430,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let archive = Arc::new(
             Archive::open(
-                storage,
+                Arc::clone(&storage) as Arc<_>,
                 &ArchiveConfig {
                     wal: WalConfig {
                         segment_bytes: 64 * 1024,
@@ -358,16 +442,17 @@ mod tests {
             )
             .expect("archive"),
         );
-        serve_archive(archive).await
+        serve_archive(archive, storage).await
     }
 
     /// Serves an archive the caller built, for tests that need a specific config.
     async fn serve_archive(
         archive: Arc<Archive>,
+        storage: Arc<InMemoryStorage>,
     ) -> (FlightServiceClient<tonic::transport::Channel>, Arc<Archive>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
-        let service = HetidaFlightService::new(Arc::clone(&archive));
+        let service = HetidaFlightService::new(Arc::clone(&archive), storage as Arc<_>);
 
         tokio::spawn(async move {
             Server::builder()
@@ -596,7 +681,7 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let service = HetidaFlightService::new(archive);
+            let service = HetidaFlightService::new(archive, Arc::clone(&storage) as Arc<_>);
             let response = service
                 .do_action(Request::new(Action {
                     r#type: REGISTER_ACTION.to_owned(),
@@ -842,7 +927,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let archive = Arc::new(
             Archive::open(
-                storage,
+                Arc::clone(&storage) as Arc<_>,
                 &ArchiveConfig {
                     max_memtable_bytes: 1,
                     wal: WalConfig {
@@ -855,7 +940,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (mut client, _) = serve_archive(Arc::clone(&archive)).await;
+        let (mut client, _) = serve_archive(Arc::clone(&archive), storage).await;
 
         // The first write fills the memtable; the second meets the cap.
         write(
@@ -889,7 +974,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let archive = Arc::new(
             Archive::open(
-                storage,
+                Arc::clone(&storage) as Arc<_>,
                 &ArchiveConfig {
                     tables: vec![(
                         "readings".to_owned(),
@@ -908,7 +993,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let (mut client, _) = serve_archive(Arc::clone(&archive)).await;
+        let (mut client, _) = serve_archive(Arc::clone(&archive), storage).await;
 
         // A live partition is accepted.
         write(
@@ -935,25 +1020,229 @@ mod tests {
         );
     }
 
-    /// §5: an endpoint that does not exist yet must say so, not drop the
-    /// connection — a generic client expects to be told.
+    // ---- reading (§1, §5) ----
+
+    /// Runs a query over Flight and returns the rows it answered with.
+    async fn read(
+        client: &mut FlightServiceClient<tonic::transport::Channel>,
+        sql: &str,
+        as_of: Option<i64>,
+    ) -> Result<Vec<arrow::array::RecordBatch>, Status> {
+        let ticket = Ticket {
+            ticket: Query {
+                sql: sql.to_owned(),
+                as_of_micros: as_of,
+            }
+            .encode_to_vec()
+            .into(),
+        };
+        let stream = client.do_get(ticket).await?.into_inner();
+        FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
+            .try_collect()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))
+    }
+
+    /// §5: the round trip a client actually makes — write, then read the same
+    /// rows back over `do_get`.
+    #[tokio::test]
+    async fn written_rows_come_back_over_do_get() {
+        let (mut client, _archive) = serve().await;
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 1_000, 1.5), (2, 2_000, 2.5)])],
+        )
+        .await
+        .expect("do_put");
+
+        let batches = read(&mut client, "SELECT * FROM readings", None)
+            .await
+            .expect("do_get");
+
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            2,
+            "both rows must come back"
+        );
+    }
+
+    /// §1: the observation point travels in the ticket, and answers with the
+    /// version current at it.
+    #[tokio::test]
+    async fn the_ticket_carries_the_observation_point() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let clock = Arc::new(TestClock::new(1_000));
+        let archive = Arc::new(
+            Archive::open(
+                Arc::clone(&storage) as Arc<_>,
+                &ArchiveConfig {
+                    wal: WalConfig {
+                        segment_bytes: 64 * 1024,
+                        max_commit_delay: Duration::ZERO,
+                    },
+                    ..ArchiveConfig::default()
+                },
+                Arc::clone(&clock) as Arc<_>,
+            )
+            .unwrap(),
+        );
+        let (mut client, _) = serve_archive(Arc::clone(&archive), storage).await;
+
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 500, 1.5)])],
+        )
+        .await
+        .unwrap();
+        clock.set(9_000);
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 500, 9.9)])],
+        )
+        .await
+        .unwrap();
+
+        let earlier = read(&mut client, "SELECT * FROM readings", Some(1_000))
+            .await
+            .unwrap();
+        let now = read(&mut client, "SELECT * FROM readings", None)
+            .await
+            .unwrap();
+
+        let value = |batches: &[arrow::array::RecordBatch]| -> f64 {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name("value")
+                        .and_then(|c| c.as_any().downcast_ref::<arrow::array::Float64Array>())
+                        .map(|values| values.values().to_vec())
+                        .unwrap_or_default()
+                })
+                .next()
+                .expect("a value")
+        };
+
+        assert_eq!(value(&earlier), 1.5, "the earlier point sees the original");
+        assert_eq!(value(&now), 9.9, "and now sees the correction");
+    }
+
+    /// §5: the standard flow. `get_flight_info` describes the query and hands
+    /// back a ticket, and that ticket runs it — so a generic Flight client that
+    /// knows nothing about this server can follow it.
+    #[tokio::test]
+    async fn get_flight_info_hands_back_a_ticket_that_works() {
+        let (mut client, _archive) = serve().await;
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 1_000, 1.5)])],
+        )
+        .await
+        .unwrap();
+
+        let info = client
+            .get_flight_info(FlightDescriptor::new_cmd(
+                Query {
+                    sql: "SELECT * FROM readings".to_owned(),
+                    as_of_micros: None,
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .expect("get_flight_info")
+            .into_inner();
+
+        let ticket = info
+            .endpoint
+            .first()
+            .and_then(|endpoint| endpoint.ticket.clone())
+            .expect("an endpoint with a ticket");
+
+        let stream = client.do_get(ticket).await.expect("do_get").into_inner();
+        let batches: Vec<arrow::array::RecordBatch> =
+            FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
+                .try_collect()
+                .await
+                .expect("rows");
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert!(!info.schema.is_empty(), "the info must describe the schema");
+    }
+
+    /// §5: `get_schema` answers without running the query, so a client can
+    /// prepare for an answer it has not asked for yet.
+    #[tokio::test]
+    async fn get_schema_describes_a_query_without_running_it() {
+        let (mut client, _archive) = serve().await;
+        write(
+            &mut client,
+            "readings",
+            vec![client_batch(&[(1, 1_000, 1.5)])],
+        )
+        .await
+        .unwrap();
+
+        let result = client
+            .get_schema(FlightDescriptor::new_cmd(
+                Query {
+                    sql: "SELECT * FROM readings".to_owned(),
+                    as_of_micros: None,
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .expect("get_schema")
+            .into_inner();
+
+        let schema = arrow::datatypes::Schema::try_from(&result).expect("a schema");
+        assert!(schema.field_with_name("value").is_ok());
+        assert!(
+            schema.field_with_name(crate::schema::SEQ_COLUMN).is_err(),
+            "the resolved view hides the system columns (§1)"
+        );
+    }
+
+    /// A ticket that is not a `Query` is a client bug, and saying so beats
+    /// failing somewhere inside the planner.
+    #[tokio::test]
+    async fn a_malformed_ticket_is_invalid_argument() {
+        let (mut client, _archive) = serve().await;
+
+        let status = client
+            .do_get(Ticket {
+                ticket: b"not a protobuf message at all".to_vec().into(),
+            })
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// SQL the server will never answer is `INVALID_ARGUMENT`, not an internal
+    /// error: retrying it changes nothing.
+    #[tokio::test]
+    async fn a_query_against_an_unknown_table_is_invalid_argument() {
+        let (mut client, _archive) = serve().await;
+
+        let status = read(&mut client, "SELECT * FROM absent", None)
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// §5: what is still unserved must say so rather than drop the connection.
     #[tokio::test]
     async fn unserved_endpoints_report_unimplemented() {
         let (mut client, _archive) = serve().await;
 
         assert_eq!(
             client
-                .do_get(Ticket {
-                    ticket: Vec::new().into()
-                })
-                .await
-                .expect_err("not yet served")
-                .code(),
-            tonic::Code::Unimplemented
-        );
-        assert_eq!(
-            client
-                .get_flight_info(FlightDescriptor::new_path(vec!["readings".to_owned()]))
+                .handshake(stream::iter(vec![HandshakeRequest::default()]))
                 .await
                 .expect_err("not yet served")
                 .code(),

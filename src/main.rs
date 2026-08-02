@@ -238,7 +238,10 @@ async fn main() -> anyhow::Result<()> {
     println!("hetida-db: serving Arrow Flight on {address}");
 
     Server::builder()
-        .add_service(FlightServiceServer::new(HetidaFlightService::new(archive)))
+        .add_service(FlightServiceServer::new(HetidaFlightService::new(
+            archive,
+            storage as Arc<_>,
+        )))
         .serve_with_shutdown(address, shutdown())
         .await
         .context("the Flight server stopped with an error")?;
