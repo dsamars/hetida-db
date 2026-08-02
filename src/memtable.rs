@@ -17,7 +17,7 @@
 //! list. Global `(metric_id, timestamp, seq)` order is produced by
 //! [`MemTable::sorted`] at flush time, which is exactly where §1 wants it.
 //!
-//! Retransmission suppression compares against a [`SuppressionIndex`] the table
+//! Unchanged-value suppression compares against a [`SuppressionIndex`] the table
 //! only borrows. That state deliberately does not belong to the table: a freeze
 //! (§2) would reset it, and the §1 guarantee would then depend on flush timing.
 //!
@@ -255,7 +255,7 @@ impl MemTable {
         Ok(outcome)
     }
 
-    /// Decides which rows survive §1 retransmission suppression.
+    /// Decides which rows survive §1 unchanged-value suppression.
     ///
     /// A row is discarded when its payload digest matches the newest version
     /// within reach for the same logical row — which spans freezes, because the

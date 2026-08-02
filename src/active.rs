@@ -18,11 +18,13 @@
 //!
 //! # Suppression scope
 //!
-//! Retransmission suppression (§1) must reach across a freeze: the comparison
+//! Unchanged-value suppression (§1) must reach across a freeze: the comparison
 //! state lives in a [`SuppressionIndex`] this holder owns and lends to every
 //! table it installs, so retiring a table does not reset it. Its reach is the
-//! configured ingest-time window, not the lifetime of a table — that is what
-//! keeps the guarantee independent of flush timing.
+//! ingest-time window configured for *this table*, not the lifetime of a
+//! memtable — which is what keeps the guarantee independent of flush timing, and
+//! what lets a table recomputed hourly and a table fed by a stream sit in the
+//! same instance with the reach each needs (§6).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +34,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
 use crate::memtable::{InsertOutcome, MemTable, MemTableError};
-use crate::suppression::SuppressionIndex;
+use crate::suppression::{SuppressionConfig, SuppressionIndex};
 
 /// Holds the table currently accepting writes and swaps it out on flush.
 #[derive(Debug)]
@@ -43,15 +45,20 @@ pub struct ActiveMemTable {
 }
 
 impl ActiveMemTable {
-    /// Creates a holder with a fresh, empty table and the default reach (§1).
-    pub fn new(schema: SchemaRef) -> Result<Self, MemTableError> {
-        Self::with_suppression(schema, Arc::new(SuppressionIndex::default()))
+    /// Creates a holder with a fresh, empty table and the given reach.
+    ///
+    /// The reach is a per-table setting (§1, §6): a table a job recomputes on a
+    /// schedule needs a window spanning its run interval, where a table fed by a
+    /// stream needs minutes and would not afford hours. There is deliberately no
+    /// instance-wide default to fall back on — see [`SuppressionConfig`].
+    pub fn new(schema: SchemaRef, suppression: SuppressionConfig) -> Result<Self, MemTableError> {
+        Self::with_suppression(schema, Arc::new(SuppressionIndex::new(suppression)))
     }
 
     /// Creates a holder comparing against `suppression`.
     ///
     /// The index outlives every table installed here, which is what lets a
-    /// retransmission arriving after a freeze still be recognised (§1).
+    /// repeat arriving after a freeze still be recognised (§1).
     pub fn with_suppression(
         schema: SchemaRef,
         suppression: Arc<SuppressionIndex>,
@@ -173,7 +180,7 @@ mod tests {
     }
 
     fn active() -> ActiveMemTable {
-        ActiveMemTable::new(storage_schema()).unwrap()
+        ActiveMemTable::new(storage_schema(), SuppressionConfig::default()).unwrap()
     }
 
     #[test]
@@ -310,14 +317,98 @@ mod tests {
 
     /// Holder with an explicit reach, for the window and cap properties.
     fn active_with(window: Micros, max_entries: usize) -> ActiveMemTable {
-        ActiveMemTable::with_suppression(
+        ActiveMemTable::new(
             storage_schema(),
-            Arc::new(SuppressionIndex::new(SuppressionConfig {
+            SuppressionConfig {
                 window,
                 max_entries,
-            })),
+            },
         )
         .unwrap()
+    }
+
+    /// One hour of ingest time.
+    const HOUR: Micros = 3_600_000_000;
+
+    /// Runs `runs` recomputations an hour apart, each rewriting the same value,
+    /// and returns how many versions survived across all tables.
+    fn versions_after_hourly_runs(active: &ActiveMemTable, runs: u64) -> usize {
+        let mut tables = Vec::new();
+        for run in 0..runs {
+            let stamped = at(1, 10, run, 1.5, run as Micros * HOUR);
+            active.insert(&stamped).unwrap();
+            // A day of ingest crosses many flushes.
+            tables.push(active.freeze().unwrap());
+        }
+        tables.push(active.current());
+        tables.iter().map(|table| table.num_rows()).sum()
+    }
+
+    /// §1: the dominant case. A job recomputing its horizon every hour
+    /// resubmits unchanged values; with the reach sized on the run interval, a
+    /// full day of runs must leave a single version.
+    #[test]
+    fn a_day_of_hourly_recomputation_leaves_one_version() {
+        let active =
+            ActiveMemTable::new(storage_schema(), SuppressionConfig::for_recomputed(HOUR)).unwrap();
+
+        assert_eq!(
+            versions_after_hourly_runs(&active, 24),
+            1,
+            "24 identical hourly runs must not manufacture versions"
+        );
+    }
+
+    /// §1: sizing the reach for network timeouts leaves the recomputation case
+    /// unhandled — which is the error the per-table window corrects. This pins
+    /// that a stream-sized window genuinely does not cover an hourly rhythm, so
+    /// the distinction is not decoration.
+    #[test]
+    fn a_stream_sized_window_does_not_cover_an_hourly_rhythm() {
+        let active =
+            ActiveMemTable::new(storage_schema(), SuppressionConfig::for_stream()).unwrap();
+
+        assert_eq!(
+            versions_after_hourly_runs(&active, 24),
+            24,
+            "a stream window must not be expected to span hours"
+        );
+    }
+
+    /// §1, §6: the reach belongs to the table. Two tables must be able to hold
+    /// opposite settings without one leaking into the other.
+    #[test]
+    fn two_tables_keep_independent_reach() {
+        let recomputed =
+            ActiveMemTable::new(storage_schema(), SuppressionConfig::for_recomputed(HOUR)).unwrap();
+        let streamed =
+            ActiveMemTable::new(storage_schema(), SuppressionConfig::for_stream()).unwrap();
+
+        assert_eq!(versions_after_hourly_runs(&recomputed, 6), 1);
+        assert_eq!(versions_after_hourly_runs(&streamed, 6), 6);
+    }
+
+    /// §1: the window runs from the last touch, so a run that changes a value
+    /// mid-series is still recognised as a change and everything after it is
+    /// suppressed against the new value.
+    #[test]
+    fn a_change_inside_a_recomputation_series_is_the_only_new_version() {
+        let active =
+            ActiveMemTable::new(storage_schema(), SuppressionConfig::for_recomputed(HOUR)).unwrap();
+        let mut tables = Vec::new();
+
+        for run in 0..12u64 {
+            // The forecast changes once, at run 6.
+            let value = if run < 6 { 1.5 } else { 2.5 };
+            active
+                .insert(&at(1, 10, run, value, run as Micros * HOUR))
+                .unwrap();
+            tables.push(active.freeze().unwrap());
+        }
+        tables.push(active.current());
+
+        let total: usize = tables.iter().map(|table| table.num_rows()).sum();
+        assert_eq!(total, 2, "one version per distinct value, not per run");
     }
 
     /// §1: suppression reaches across a freeze. Tying it to the active table

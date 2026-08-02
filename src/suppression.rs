@@ -28,7 +28,14 @@
 //!
 //! Expiry is generational rather than per entry: two maps, and a rotation
 //! discards the older one whole. An entry therefore stays comparable for at
-//! least one window and at most two, and eviction costs nothing per entry.
+//! least one window and at most two, and eviction costs nothing per entry. An
+//! observation that jumps over both windows at once retires both, so the bound
+//! holds however sparsely a table is written.
+//!
+//! The window is measured from the last time a row was *touched*, not written: a
+//! lookup that hits the older generation carries the entry into the current one.
+//! A producer resubmitting an unchanged value therefore keeps its comparison
+//! state alive, which is exactly the recomputation case §1 is sized for.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,12 +77,47 @@ pub struct SuppressionConfig {
     pub max_entries: usize,
 }
 
-impl Default for SuppressionConfig {
-    fn default() -> Self {
+impl SuppressionConfig {
+    /// Entries one generation holds by default, in both presets below.
+    pub const DEFAULT_MAX_ENTRIES: usize = 2_000_000;
+
+    /// Reach for a table a scheduled job recomputes every `run_interval`.
+    ///
+    /// This is the dominant workload (§1): a job rewriting its whole horizon
+    /// resubmits values that mostly have not changed, and the reach has to span
+    /// the gap between two runs or every run manufactures a version. The
+    /// guaranteed reach is one window, so pass the interval generously enough to
+    /// absorb the jitter of a scheduled job — a run that slips past the window
+    /// is simply not recognised.
+    ///
+    /// Memory does not grow with ingest here: the same keys recur every run, so
+    /// the state stays bounded by the horizon's cardinality.
+    pub fn for_recomputed(run_interval: Micros) -> Self {
+        Self {
+            window: run_interval,
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
+        }
+    }
+
+    /// Reach for a table fed by a stream, covering transport retries only.
+    ///
+    /// Deliberately short: a stream's keys never recur (§1), so every entry is
+    /// dead weight once its retry window has passed. This does **not** cover a
+    /// job recomputing on an hourly or daily rhythm — use [`Self::for_recomputed`]
+    /// for those, or the repeats go unrecognised.
+    pub fn for_stream() -> Self {
         Self {
             window: 5 * 60 * 1_000_000,
-            max_entries: 2_000_000,
+            max_entries: Self::DEFAULT_MAX_ENTRIES,
         }
+    }
+}
+
+impl Default for SuppressionConfig {
+    /// The stream preset — the safe default, since it is the one whose memory is
+    /// bounded without knowing the producer's rhythm.
+    fn default() -> Self {
+        Self::for_stream()
     }
 }
 
@@ -114,11 +156,20 @@ impl Generations {
     }
 
     /// The newest version recorded for `key`, current generation first.
+    ///
+    /// A hit in the older generation is promoted into the current one, so the
+    /// window runs from the last time the row was touched rather than the last
+    /// time it was written (§1). Without that, a producer resubmitting an
+    /// unchanged value would lose its comparison state two windows after the
+    /// last real change, and every second run would slip through.
     fn newest(&self, key: RowKey) -> Option<Newest> {
-        self.current
-            .get(&key)
-            .or_else(|| self.previous.get(&key))
-            .map(|entry| *entry.value())
+        if let Some(entry) = self.current.get(&key) {
+            return Some(*entry.value());
+        }
+
+        let held = *self.previous.get(&key)?.value();
+        self.current.entry(key).or_insert(held);
+        Some(held)
     }
 }
 
@@ -156,13 +207,23 @@ impl SuppressionIndex {
     /// than the window can no longer suppress anything.
     pub fn observe(&self, system_time: Micros) {
         let generations = self.generations.load();
-        let aged = system_time.saturating_sub(generations.opened) >= self.config.window;
+        let elapsed = system_time.saturating_sub(generations.opened);
+        let aged = elapsed >= self.config.window;
+        // A single observation may jump over several windows — a job that writes
+        // once an hour into a table with a window of minutes does exactly that.
+        // Retiring only one generation would leave entries reachable long past
+        // the configured window, so a jump that clears both retires both.
+        let stale = elapsed >= self.config.window.saturating_mul(2);
         let full = generations.current.len() >= self.config.max_entries;
         if !aged && !full {
             return;
         }
 
-        let rotated = Arc::new(generations.rotated(system_time));
+        let rotated = Arc::new(if stale {
+            Generations::fresh(system_time)
+        } else {
+            generations.rotated(system_time)
+        });
         // Compare-and-swap so two writers rotating at once cannot each install
         // a generation and lose the other's entries.
         let installed = self
@@ -179,6 +240,10 @@ impl SuppressionIndex {
     }
 
     /// The newest version recorded for `key` while it is within reach.
+    ///
+    /// Touching a row keeps it within reach: a hit found in the older generation
+    /// is carried into the current one, so the window measures time since the
+    /// last touch (§1).
     pub fn newest(&self, key: RowKey) -> Option<Newest> {
         self.generations.load().newest(key)
     }
@@ -343,6 +408,58 @@ mod tests {
             index.newest(key(1, 10)),
             None,
             "past two windows nothing may still suppress"
+        );
+    }
+
+    /// §1: the window runs from the last *touch*. A suppressed write records
+    /// nothing, so without this a producer resubmitting an unchanged value
+    /// would lose its comparison state and every second run would slip through.
+    #[test]
+    fn touching_an_entry_keeps_it_within_reach() {
+        let index = index();
+        index.observe(1_000);
+        index.record(key(1, 10), 0, digest(b"payload"));
+
+        // Each round advances by exactly one window and touches the entry,
+        // which is what a recomputation run does.
+        for round in 1..10 {
+            index.observe(1_000 + round * WINDOW);
+            assert_eq!(
+                index.newest(key(1, 10)),
+                Some((0, digest(b"payload"))),
+                "the entry aged out at round {round} despite being touched"
+            );
+        }
+    }
+
+    /// One observation may jump over both windows — a job writing once an hour
+    /// into a table with a window of minutes. Retiring a single generation would
+    /// leave entries reachable far past the configured window.
+    #[test]
+    fn a_jump_over_both_windows_retires_both() {
+        let index = index();
+        index.observe(1_000);
+        index.record(key(1, 10), 0, digest(b"payload"));
+
+        index.observe(1_000 + 2 * WINDOW);
+
+        assert_eq!(
+            index.newest(key(1, 10)),
+            None,
+            "a jump past two windows must leave nothing reachable"
+        );
+    }
+
+    /// §1: the two presets exist because the workloads want opposite reach.
+    #[test]
+    fn the_recomputation_preset_spans_its_run_interval() {
+        const HOUR: Micros = 3_600_000_000;
+
+        let recomputed = SuppressionConfig::for_recomputed(HOUR);
+        assert_eq!(recomputed.window, HOUR);
+        assert!(
+            SuppressionConfig::for_stream().window < HOUR,
+            "the stream preset must not silently span hours"
         );
     }
 

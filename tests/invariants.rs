@@ -28,6 +28,7 @@ use hetida_db::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, append_system_fields
 use hetida_db::seq::{AtomicSequence, Seq, SequenceSource};
 use hetida_db::stamp::Stamper;
 use hetida_db::storage::{Fault, InMemoryStorage, Storage};
+use hetida_db::suppression::SuppressionConfig;
 use hetida_db::wal::{RecordKind, WalConfig, WalRecord, WalWriter, replay};
 use proptest::prelude::*;
 
@@ -197,8 +198,11 @@ proptest! {
         freezes in prop::collection::vec(any::<bool>(), 24),
     ) {
         let versions = |retransmit: bool| -> usize {
-            let active = ActiveMemTable::new(append_system_fields(&client_schema()))
-                .expect("holder");
+            let active = ActiveMemTable::new(
+                append_system_fields(&client_schema()),
+                SuppressionConfig::default(),
+            )
+            .expect("holder");
             let stamper = Stamper::new(
                 Arc::new(TestClock::new(1_000)),
                 Arc::new(AtomicSequence::starting_at(0)),
