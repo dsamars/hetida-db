@@ -166,6 +166,17 @@ Retention has a **second, independent dimension** since §1:
 
 - **The partition interval is a parameter, fixed when an instance is initialized.** Valid values are `hour`, `day`, `month`, `year`; the default is `month`.
   - Typical queries span weeks to months over a few metrics. A month-granular layout answers those from one to three directories, where a day-granular one opens thirty to ninety and pays a footer read on each to retrieve a few kilobytes per metric — metadata overhead, not scan volume, dominates that pattern.
+- **Measured, not only argued** (Phase 4, `benches/query.rs`). Eight metrics written hourly over thirty days, queried for a fortnight of two of them — the workload above — against all four intervals:
+
+  | Interval | Partitions | Files | Bytes scanned | Latency |
+  |---|---|---|---|---|
+  | `hour` | 720 | 720 | 615 910 | 46.5 ms |
+  | `day` | 30 | 30 | 37 609 | 2.1 ms |
+  | `month` | 1 | 1 | 33 422 | 1.2 ms |
+  | `year` | 1 | 1 | 33 422 | 1.2 ms |
+
+  Same 672 rows in every case. `hour` reads eighteen times the bytes and takes thirty-eight times as long, which is the metadata overhead this section claims and not scan volume. The measurement decisively rules out `hour` and `day`; it does **not** separate `month` from `year`, because a thirty-day span falls inside one partition of either. Distinguishing those two needs a span of years, where `year` starts paying for row groups a `month` layout would never open.
+
 - **Calendar-aligned intervals only, never arbitrary durations.** The Hive path encodes calendar fields, so a `WHERE timestamp BETWEEN …` predicate maps straight onto partition columns DataFusion can prune. An arbitrary duration would require a synthetic bucket column and lose that mapping.
 
   | Interval | Path |

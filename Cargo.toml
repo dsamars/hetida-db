@@ -71,7 +71,12 @@ tonic = { version = "0.14", features = ["transport", "router", "server", "channe
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
+# Phase 4 micro-benchmarks. Statistical, so it belongs on components a benchmark
+# can hold still — not on anything that crosses the network, where jitter
+# invalidates its estimates. That measurement has its own harness.
+criterion = "0.7"
 proptest = "1"
+# The load harness writes into a temporary archive when none is configured.
 tempfile = "3"
 # test-util gives paused time, so a timer-driven test is deterministic rather
 # than sleeping (CLAUDE.md: no sleep, no wall-clock assertions).
@@ -83,3 +88,11 @@ tokio-stream = "0.1"
 # installed system-wide — prost-build's default path shells out to it.
 prost-build = "0.14"
 protox = "0.9"
+
+[[bench]]
+name = "ingest"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false

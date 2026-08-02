@@ -13,7 +13,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Introduce an injectable sequence source so `seq` ordering is deterministic under test (§1).
 - [x] Introduce a storage abstraction able to inject torn writes and I/O errors, so WAL recovery is tested deterministically instead of by killing processes (§4).
 - [x] Add `proptest` and set up the invariant suite in `tests/invariants.rs`, with the properties the Phase 0 foundation supports.
-- [ ] Carried to Phase 1 — suppression idempotence is now a property in `tests/invariants.rs`; the remaining two §1 invariants describe components that do not exist yet: version resolution at arbitrary observation points, and sort order surviving flush and compaction.
+- [x] Carried and now closed — all three §1 invariants are properties in `tests/invariants.rs`. *Resolution at an arbitrary observation point was mutation-checked: ignoring the point makes it fail.*
 
 ## Phase 1: Data Model & Ingestion Engine
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
@@ -53,15 +53,15 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Implement per-table read/write authorization against the table from `FlightDescriptor::path` (`do_put`) and from the parsed SQL (`do_get`), behind a pluggable credential store with a static-config backend for v1 (§9). *Read grants are checked against the tables the planned query touches, so a join or a view cannot reach round them. `get_schema` needs the same grant as the rows.*
 
 ## Phase 4: Benchmarks & High-Concurrency Stress Testing
-- [ ] Micro-benchmark ingestion components with `criterion`: `MemTable` insert, WAL append, Parquet write.
-- [ ] Build a dedicated load harness (not `criterion` — network jitter invalidates its statistics) and measure `do_put` throughput with 100 parallel Arrow Flight clients.
-- [ ] Measure `do_get` query latency and network throughput under heavy write load via the same harness.
-- [ ] Verify zero-copy behavior, and that flushed and compacted files stay sorted by `(metric_id, timestamp, seq)` with every version preserved.
-- [ ] Verify time travel: write a value, correct it, and confirm each observation point returns the version current at that point — before the first write, between the two, and after. Include corrections that land after their partition was flushed and compacted.
-- [ ] Verify retransmission suppression: re-sending an identical batch creates no new version and leaves every observation point's answer unchanged.
-- [ ] Benchmark as-of query latency against version depth (1, 10, 100 versions per logical row) to confirm the streaming merge does not degrade into a full sort.
-- [ ] Verify crash recovery: kill mid-write, confirm startup succeeds, acked data survives, the registry is intact, and replay is deterministic.
-- [ ] Verify metric pruning: a query on a few metrics out of many reads only the matching row groups, measured by bytes scanned rather than wall time (§11).
-- [ ] Benchmark the partition interval variants (`hour`/`day`/`month`/`year`) against the real workload — few metrics over weeks to months — reporting files opened, bytes scanned and latency, to settle the default empirically (§11).
-- [ ] Verify retention: expired partitions are dropped, live partitions stay untouched, expired-range ingestion is rejected.
-- [ ] Verify authorization: unauthenticated calls are refused, and per-table grants are enforced on both `do_put` and `do_get`.
+- [x] Micro-benchmark ingestion components with `criterion`: `MemTable` insert, WAL append, Parquet write. *`benches/ingest.rs`, plus the whole `Archive::ingest` so a regression can be attributed to a component rather than guessed at. All linear in batch size.*
+- [x] Build a dedicated load harness (not `criterion` — network jitter invalidates its statistics) and measure `do_put` throughput with 100 parallel Arrow Flight clients. *`examples/loadgen.rs`, reporting order statistics rather than a mean: 306 000 rows/s, p50 151 ms, p99 321 ms over 100 clients on loopback.*
+- [x] Measure `do_get` query latency and network throughput under heavy write load via the same harness. *Readers start before the writers, so the figure is read latency under load and not on an idle server: p50 201 ms, p99 375 ms.*
+- [x] Verify zero-copy behavior, and that flushed and compacted files stay sorted by `(metric_id, timestamp, seq)` with every version preserved. *Zero copy by pointer identity — nothing else distinguishes a share from a copy of equal values. Sort order is also a property over generated runs.*
+- [x] Verify time travel: write a value, correct it, and confirm each observation point returns the version current at that point — before the first write, between the two, and after. Include corrections that land after their partition was flushed and compacted. *Both as an example and as a property over arbitrary runs with flushes at arbitrary points.*
+- [x] Verify retransmission suppression: re-sending an identical batch creates no new version and leaves every observation point's answer unchanged. *Across a flush, and checked at an earlier observation point too — a version count alone would not catch a moved answer.*
+- [x] Benchmark as-of query latency against version depth (1, 10, 100 versions per logical row) to confirm the streaming merge does not degrade into a full sort. *0.88 ms / 1.36 ms / 5.90 ms for 1 / 10 / 100 versions — sublinear in the rows read, so the merge holds.*
+- [x] Verify crash recovery: kill mid-write, confirm startup succeeds, acked data survives, the registry is intact, and replay is deterministic. *An injected torn write rather than a killed process; determinism is asserted by describing two replays of one store and comparing them.*
+- [x] Verify metric pruning: a query on a few metrics out of many reads only the matching row groups, measured by bytes scanned rather than wall time (§11). *24 kB of 185 kB, by id and by label alike. This is what found the label pushdown reading whole files while answering correctly.*
+- [x] Benchmark the partition interval variants (`hour`/`day`/`month`/`year`) against the real workload — few metrics over weeks to months — reporting files opened, bytes scanned and latency, to settle the default empirically (§11). *Recorded in §11. Rules out `hour` and `day` decisively; does not separate `month` from `year` at a thirty-day span, and says so.*
+- [x] Verify retention: expired partitions are dropped, live partitions stay untouched, expired-range ingestion is rejected. *All three in `tests/pipeline.rs`, end to end from ingest through flush to the reaper and back to a refused write.*
+- [x] Verify authorization: unauthenticated calls are refused, and per-table grants are enforced on both `do_put` and `do_get`. *`tests/authorization.rs` against a real server, including grants over rows already in Parquet and a token expiring mid-session.*
