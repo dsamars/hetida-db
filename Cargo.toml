@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 # gRPC transport under Arrow Flight. Pinned to the line arrow-flight 58.4
 # resolves (0.14): a different major would make its Flight service traits
 # incompatible with ours.
-tonic = "0.14"
+tonic = { version = "0.14", features = ["transport", "router", "server", "channel", "codegen"] }
 # Payload digests for §1 unchanged-value suppression. Non-cryptographic is
 # sufficient: the comparison is not adversarial — a client constructing a
 # collision would only discard its own correction, which it could equally

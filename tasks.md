@@ -20,7 +20,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Build the multi-table catalogue mapping table name to its durable `TableSchema` — recorded in the catalogue log (§4) — and its per-table configuration, applying evolution on ingest (§1, §6). *Retention duration joins `TableConfig` with §8; surfacing rejections as Flight errors lands with `do_put`.*
 - [x] Build the metric registry mapping name + label set to a `u64` id, idempotent on re-registration, durable before visible through a `RegistrationLog` seam (§10).
 - [x] Back the registry's `RegistrationLog` with the never-reclaimed catalogue log and recover it on start, skipping a torn tail (§4, §10). *The startup sequence that replays it ahead of the data log lands with `do_put`; the ordering rule is recorded in §4.*
-- [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
+- [x] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10). *Batched, over `do_action`; the service skeleton answers UNIMPLEMENTED for everything not yet served.*
 - [x] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [x] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
 - [x] Implement unchanged-value suppression: discard an incoming version whose payload digest matches the current latest version of the same logical row, over a per-table ingest-time window with a hard entry cap that survives freezes and is measured from the last touch (§1, §6).
