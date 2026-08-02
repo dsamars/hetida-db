@@ -50,6 +50,9 @@ parquet = { version = "58.4", features = ["zstd"] }
 # Control-plane message types (§5), generated from proto/hetida.proto. Pinned to
 # the line arrow-flight resolves, since Flight's own messages use the same one.
 prost = "0.14"
+# Entropy for bearer tokens (§9), through the OS. Only `OsRng` is used — a
+# seeded generator would make a token guessable from another one.
+rand = { version = "0.9", features = ["os_rng"] }
 thiserror = "2"
 # Async runtime. Features kept to what the server needs: a multi-threaded
 # runtime, the test/main macros, TCP, and signal handling for shutdown.
@@ -57,7 +60,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 # gRPC transport under Arrow Flight. Pinned to the line arrow-flight 58.4
 # resolves (0.14): a different major would make its Flight service traits
 # incompatible with ours.
-tonic = { version = "0.14", features = ["transport", "router", "server", "channel", "codegen"] }
+# `tls-ring` terminates TLS in the server (§9). Ring rather than aws-lc: it
+# builds without cmake or a C toolchain, which keeps the archive buildable
+# wherever cargo is.
+tonic = { version = "0.14", features = ["transport", "router", "server", "channel", "codegen", "tls-ring"] }
 # Payload digests for §1 unchanged-value suppression. Non-cryptographic is
 # sufficient: the comparison is not adversarial — a client constructing a
 # collision would only discard its own correction, which it could equally

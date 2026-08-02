@@ -29,7 +29,8 @@
 //! ([`compact`]) and expired by the reaper ([`retention`]), and with the whole
 //! archive queryable through DataFusion ([`query`]) over a scan that spans
 //! memory and Parquet ([`scan`], [`object_store`]) and label predicates
-//! resolved into filters on `metric_id` ([`labels`]).
+//! resolved into filters on `metric_id` ([`labels`]), behind per-table
+//! authorization ([`auth`]) an operator configures explicitly ([`serve`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -46,6 +47,7 @@
 
 pub mod active;
 pub mod archive;
+pub mod auth;
 pub mod catalog;
 pub mod catalog_log;
 pub mod clock;
@@ -81,6 +83,7 @@ pub mod retention;
 pub mod scan;
 pub mod schema;
 pub mod seq;
+pub mod serve;
 pub mod stamp;
 pub mod storage;
 pub mod suppression;

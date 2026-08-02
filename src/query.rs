@@ -50,10 +50,12 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::MemTable as DataFusionMemTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::archive::Archive;
@@ -163,6 +165,36 @@ impl QueryEngine {
         Ok(Arc::new(frame.schema().as_arrow().clone()))
     }
 
+    /// The archive tables `sql` reads, for the authorization check (§9).
+    ///
+    /// Taken from the planned logical plan rather than from the text, so a name
+    /// reached through a view, a subquery or a join is found. That is the whole
+    /// point: a query must not reach a table by going round the front door.
+    ///
+    /// Names come back as a grant would spell them — the internal `$raw` and
+    /// `$history` forms map to their base table, since a grant is on the table
+    /// and not on one of its views.
+    pub async fn tables_of(
+        &self,
+        sql: &str,
+        as_of: Option<Micros>,
+    ) -> Result<Vec<String>, QueryError> {
+        let context = self.session(as_of).await?;
+        let plan = context.state().create_logical_plan(sql).await?;
+
+        let mut scanned: Vec<String> = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                scanned.push(base_table(&scan.table_name.to_string()));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+
+        scanned.sort_unstable();
+        scanned.dedup();
+        Ok(scanned)
+    }
+
     /// The physical plan for `sql`, for tests and `EXPLAIN`-shaped checks.
     pub async fn plan_text(&self, sql: &str, as_of: Option<Micros>) -> Result<String, QueryError> {
         let context = self.session(as_of).await?;
@@ -237,6 +269,20 @@ impl QueryEngine {
         )?;
         Ok(())
     }
+}
+
+/// The table a registered name grants access to (§9).
+///
+/// The views are not separate objects to be granted: `readings`,
+/// `"readings$history"` and the internal `"readings$raw"` are three ways of
+/// asking about one table's rows, and one grant covers all three.
+fn base_table(registered: &str) -> String {
+    for suffix in [RAW_SUFFIX, HISTORY_SUFFIX] {
+        if let Some(base) = registered.strip_suffix(suffix) {
+            return base.to_owned();
+        }
+    }
+    registered.to_owned()
 }
 
 /// Session settings that keep as-of resolution a streaming merge (§1).

@@ -29,6 +29,18 @@
 //!
 //! Results stream. `do_get` writes batches as DataFusion produces them, and
 //! never collects an answer that has no reason to fit in memory.
+//!
+//! # Authorization
+//!
+//! [`BearerInterceptor`] validates the token once per call and attaches a
+//! [`Principal`], which `do_put` checks against the table its descriptor names
+//! and `do_get` against every table its SQL reads (§9). `handshake` is the one
+//! call that needs no token, since it is where one is obtained.
+//!
+//! A service built with [`HetidaFlightService::new`] enforces nothing: it is for
+//! a trusted network and for tests, and the binary refuses to start in that mode
+//! unless an operator says so explicitly. [`HetidaFlightService::with_auth`] is
+//! the configuration §9 describes.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,6 +60,7 @@ use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::archive::{Archive, IngestError};
+use crate::auth::{AuthError, Principal, TokenIssuer, bearer_token};
 use crate::proto::{Query, RegisterRequest, RegisterResponse};
 use crate::query::{QueryEngine, QueryError};
 use crate::registry::SeriesKey;
@@ -56,25 +69,88 @@ use crate::storage::Storage;
 /// Action type resolving series identities to ids (§10).
 pub const REGISTER_ACTION: &str = "register";
 
+/// The metadata key a bearer token travels in (§9).
+pub const AUTHORIZATION: &str = "authorization";
+
 /// Arrow Flight service over one archive.
 #[derive(Debug)]
 pub struct HetidaFlightService {
     archive: Arc<Archive>,
     engine: Arc<QueryEngine>,
+    issuer: Option<Arc<TokenIssuer>>,
 }
 
 impl HetidaFlightService {
-    /// Serves `archive` over Flight, reading its Parquet through `storage`.
+    /// Serves `archive` with no authorization at all.
+    ///
+    /// Every call is granted everything. Only for a trusted network and for
+    /// tests — [`Self::with_auth`] is what §9 describes, and the binary refuses
+    /// to start this way unless an operator asks for it by name.
     pub fn new(archive: Arc<Archive>, storage: Arc<dyn Storage>) -> Self {
         Self {
             engine: Arc::new(QueryEngine::new(Arc::clone(&archive), storage)),
             archive,
+            issuer: None,
         }
+    }
+
+    /// Serves `archive` with per-table authorization against `issuer` (§9).
+    pub fn with_auth(
+        archive: Arc<Archive>,
+        storage: Arc<dyn Storage>,
+        issuer: Arc<TokenIssuer>,
+    ) -> Self {
+        Self {
+            issuer: Some(issuer),
+            ..Self::new(archive, storage)
+        }
+    }
+
+    /// The principal a call was made by, or `None` when nothing is enforced.
+    ///
+    /// The token was already validated by [`BearerInterceptor`], once for the
+    /// whole call (§9). This only reads what it left behind — nothing here
+    /// touches a credential, which is what keeps validation off the per-message
+    /// path of a `do_put` stream.
+    fn principal<T>(&self, request: &Request<T>) -> Result<Option<Principal>, Status> {
+        if self.issuer.is_none() {
+            return Ok(None);
+        }
+        request
+            .extensions()
+            .get::<Principal>()
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| auth_status(&AuthError::Unauthenticated))
     }
 
     /// The archive this service serves.
     pub fn archive(&self) -> &Arc<Archive> {
         &self.archive
+    }
+
+    /// Refuses unless `principal` may read every table the query reads (§9).
+    ///
+    /// From the planned query, not from its text: a table reached through a
+    /// view, a subquery or a join is a table the answer depends on, and a grant
+    /// check that only read the `FROM` clause would miss it.
+    async fn authorize_read(
+        &self,
+        query: &Query,
+        principal: Option<&Principal>,
+    ) -> Result<(), Status> {
+        let Some(principal) = principal else {
+            return Ok(());
+        };
+        let tables = self
+            .engine
+            .tables_of(&query.sql, query.as_of_micros)
+            .await
+            .map_err(query_status)?;
+
+        principal
+            .may_read_all(tables.iter().map(String::as_str))
+            .map_err(|error| auth_status(&error))
     }
 
     /// The schema a query answers with, planned but not run (§5).
@@ -191,6 +267,54 @@ fn query_status(error: QueryError) -> Status {
     Status::invalid_argument(error.to_string())
 }
 
+/// Maps an authorization failure onto the status a client should see (§9).
+fn auth_status(error: &AuthError) -> Status {
+    match error {
+        AuthError::Unauthenticated | AuthError::BadCredentials => {
+            Status::unauthenticated(error.to_string())
+        }
+        AuthError::Forbidden { .. } => Status::permission_denied(error.to_string()),
+    }
+}
+
+/// Validates the bearer token once per call and attaches the principal (§9).
+///
+/// A `tonic` interceptor runs once per call, before the handler and before a
+/// single message is read. That is the whole point: one `do_put` stream carries
+/// thousands of `RecordBatch`es behind one authorization, and validating a token
+/// per message would put it in the ingestion hot path.
+///
+/// A call with no valid token is not refused *here*, because `handshake` is a
+/// call and has no token to present. It simply arrives with no principal
+/// attached, and every handler that needs one refuses it.
+#[derive(Debug, Clone)]
+pub struct BearerInterceptor {
+    issuer: Arc<TokenIssuer>,
+}
+
+impl BearerInterceptor {
+    /// Validates against `issuer`.
+    pub fn new(issuer: Arc<TokenIssuer>) -> Self {
+        Self { issuer }
+    }
+}
+
+impl tonic::service::Interceptor for BearerInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        let token = request
+            .metadata()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(bearer_token)
+            .map(ToOwned::to_owned);
+
+        if let Some(principal) = token.and_then(|token| self.issuer.validate(&token).ok()) {
+            request.extensions_mut().insert(principal);
+        }
+        Ok(request)
+    }
+}
+
 /// A stream of one item, which is what an action result is here.
 fn one<T: Send + 'static>(item: T) -> BoxStream<'static, Result<T, Status>> {
     Box::pin(stream::once(async move { Ok(item) }))
@@ -241,13 +365,48 @@ impl FlightService for HetidaFlightService {
 
     // ---- not yet served (§5) ----
 
+    /// Exchanges credentials for a bearer token (§9).
+    ///
+    /// The payload is `user:password`, as Flight's handshake conventionally
+    /// carries it, and the token comes back both in the response payload and in
+    /// the `authorization` metadata so either style of client can pick it up.
+    /// This is the one call that needs no token.
     async fn handshake(
         &self,
-        _request: Request<Streaming<HandshakeRequest>>,
+        request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        Err(Status::unimplemented(
-            "handshake arrives with authentication (§9)",
-        ))
+        let Some(issuer) = self.issuer.clone() else {
+            return Err(Status::unimplemented(
+                "this server enforces no authorization, so there is no token to issue (§9)",
+            ));
+        };
+
+        let mut incoming = request.into_inner();
+        let first = incoming
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("handshake received no credentials"))?;
+
+        let payload = String::from_utf8(first.payload.to_vec()).map_err(|_| {
+            Status::invalid_argument("credentials must be `user:password` in UTF-8")
+        })?;
+        let (user, password) = payload
+            .split_once(':')
+            .ok_or_else(|| Status::invalid_argument("credentials must be `user:password`"))?;
+
+        let token = issuer
+            .handshake(user, password)
+            .map_err(|error| auth_status(&error))?;
+
+        let mut response = Response::new(one(HandshakeResponse {
+            protocol_version: 0,
+            payload: token.clone().into_bytes().into(),
+        }) as Self::HandshakeStream);
+        if let (Ok(key), Ok(value)) = (AUTHORIZATION.parse(), format!("Bearer {token}").parse()) {
+            let key: tonic::metadata::AsciiMetadataKey = key;
+            response.metadata_mut().insert(key, value);
+        }
+        Ok(response)
     }
 
     async fn list_flights(
@@ -268,8 +427,11 @@ impl FlightService for HetidaFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        let principal = self.principal(&request)?;
         let descriptor = request.into_inner();
         let query = query_from(&descriptor.cmd)?;
+        // A schema describes the data, so it needs the same grant the rows do.
+        self.authorize_read(&query, principal.as_ref()).await?;
         let schema = self.schema_for(&query).await?;
 
         let info = FlightInfo::new()
@@ -297,7 +459,9 @@ impl FlightService for HetidaFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
+        let principal = self.principal(&request)?;
         let query = query_from(&request.into_inner().cmd)?;
+        self.authorize_read(&query, principal.as_ref()).await?;
         let schema = self.schema_for(&query).await?;
 
         SchemaAsIpc::new(schema.as_ref(), &IpcWriteOptions::default())
@@ -314,7 +478,10 @@ impl FlightService for HetidaFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let principal = self.principal(&request)?;
         let query = query_from(&request.into_inner().ticket)?;
+        self.authorize_read(&query, principal.as_ref()).await?;
+
         let results = self
             .engine
             .stream(&query.sql, query.as_of_micros)
@@ -341,6 +508,7 @@ impl FlightService for HetidaFlightService {
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let archive = Arc::clone(&self.archive);
+        let principal = self.principal(&request)?;
         let mut incoming = request.into_inner().peekable();
 
         // The descriptor rides on the first message, so it is read before the
@@ -355,6 +523,12 @@ impl FlightService for HetidaFlightService {
             None => return Err(Status::invalid_argument("do_put received no data")),
         };
         let table = table_from(&path)?.to_owned();
+
+        // §9: once, for the whole stream. The batches behind this one check are
+        // unbounded in number, which is exactly why it does not repeat.
+        if let Some(principal) = &principal {
+            principal.may_write(&table).map_err(|e| auth_status(&e))?;
+        }
 
         let mut batches =
             FlightRecordBatchStream::new_from_flight_data(incoming.map_err(FlightError::from));
@@ -1247,6 +1421,367 @@ mod tests {
                 .expect_err("not yet served")
                 .code(),
             tonic::Code::Unimplemented
+        );
+    }
+
+    // ---- authentication and authorization (§9) ----
+
+    /// Serves an archive with per-table grants behind a bearer token.
+    async fn serve_with_auth(
+        credentials: Arc<crate::auth::StaticCredentials>,
+    ) -> FlightServiceClient<tonic::transport::Channel> {
+        use crate::auth::{DEFAULT_TOKEN_TTL, TestTokens};
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let archive = Arc::new(
+            Archive::open(
+                Arc::clone(&storage) as Arc<_>,
+                &ArchiveConfig {
+                    wal: WalConfig {
+                        segment_bytes: 64 * 1024,
+                        max_commit_delay: Duration::ZERO,
+                    },
+                    ..ArchiveConfig::default()
+                },
+                Arc::new(TestClock::new(1_000)),
+            )
+            .expect("archive"),
+        );
+        let issuer = Arc::new(TokenIssuer::new(
+            credentials,
+            Arc::new(TestTokens::default()),
+            Arc::new(TestClock::new(1_000)),
+            DEFAULT_TOKEN_TTL,
+        ));
+        let service =
+            HetidaFlightService::with_auth(archive, storage as Arc<_>, Arc::clone(&issuer));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::with_interceptor(
+                    service,
+                    BearerInterceptor::new(issuer),
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .ok();
+        });
+
+        let endpoint = format!("http://{address}");
+        loop {
+            match tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .expect("endpoint")
+                .connect()
+                .await
+            {
+                Ok(channel) => break FlightServiceClient::new(channel),
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    fn credentials() -> Arc<crate::auth::StaticCredentials> {
+        use crate::auth::{Grants, StaticCredentials, TableSet};
+
+        Arc::new(
+            StaticCredentials::new()
+                .with_user("writer", "s3cret", Grants::all())
+                .with_user("reader", "hunter2", Grants::read_only(["readings"]))
+                .with_user(
+                    "events-only",
+                    "pw",
+                    Grants {
+                        read: TableSet::named(["events"]),
+                        write: TableSet::named(["events"]),
+                    },
+                ),
+        )
+    }
+
+    /// Exchanges credentials for a token over the handshake.
+    async fn handshake(
+        client: &mut FlightServiceClient<tonic::transport::Channel>,
+        user: &str,
+        password: &str,
+    ) -> Result<String, Status> {
+        let request = HandshakeRequest {
+            protocol_version: 0,
+            payload: format!("{user}:{password}").into_bytes().into(),
+        };
+        let mut responses = client
+            .handshake(stream::iter(vec![request]))
+            .await?
+            .into_inner();
+        let first = futures::TryStreamExt::try_next(&mut responses)
+            .await?
+            .ok_or_else(|| Status::internal("no handshake response"))?;
+
+        String::from_utf8(first.payload.to_vec())
+            .map_err(|_| Status::internal("token is not UTF-8"))
+    }
+
+    /// Attaches a bearer token to a request, as a client does on every call.
+    fn bearing<T>(message: T, token: &str) -> Request<T> {
+        let mut request = Request::new(message);
+        if let (Ok(key), Ok(value)) = (
+            AUTHORIZATION.parse::<tonic::metadata::AsciiMetadataKey>(),
+            format!("Bearer {token}").parse(),
+        ) {
+            request.metadata_mut().insert(key, value);
+        }
+        request
+    }
+
+    /// A `do_get` carrying a token, or none.
+    async fn read_as(
+        client: &mut FlightServiceClient<tonic::transport::Channel>,
+        sql: &str,
+        token: Option<&str>,
+    ) -> Result<usize, Status> {
+        let ticket = Ticket {
+            ticket: Query {
+                sql: sql.to_owned(),
+                as_of_micros: None,
+            }
+            .encode_to_vec()
+            .into(),
+        };
+        let request = match token {
+            Some(token) => bearing(ticket, token),
+            None => Request::new(ticket),
+        };
+
+        let stream = client.do_get(request).await?.into_inner();
+        let batches: Vec<arrow::array::RecordBatch> =
+            FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::from))
+                .try_collect()
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    /// A `do_put` carrying a token, or none.
+    async fn write_as(
+        client: &mut FlightServiceClient<tonic::transport::Channel>,
+        table: &str,
+        token: Option<&str>,
+    ) -> Result<usize, Status> {
+        let encoded: Vec<FlightData> = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(FlightDescriptor::new_path(vec![table.to_owned()])))
+            .build(stream::iter(vec![Ok(client_batch(&[(1, 1_000, 1.5)]))]))
+            .try_collect()
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        let outgoing = stream::iter(encoded);
+        let request = match token {
+            Some(token) => bearing(outgoing, token),
+            None => Request::new(outgoing),
+        };
+
+        let mut acks = client.do_put(request).await?.into_inner();
+        let mut count = 0;
+        while futures::TryStreamExt::try_next(&mut acks).await?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// §9: a handshake exchanges credentials for a bearer token, and that token
+    /// is what admits every later call.
+    #[tokio::test]
+    async fn a_handshake_yields_a_token_that_admits_calls() {
+        let mut client = serve_with_auth(credentials()).await;
+
+        let token = handshake(&mut client, "writer", "s3cret")
+            .await
+            .expect("accepted");
+
+        assert_eq!(
+            write_as(&mut client, "readings", Some(&token))
+                .await
+                .expect("the token must admit the write"),
+            1
+        );
+    }
+
+    /// §9: an unauthenticated call is refused, on both directions.
+    #[tokio::test]
+    async fn calls_without_a_token_are_refused() {
+        let mut client = serve_with_auth(credentials()).await;
+
+        assert_eq!(
+            write_as(&mut client, "readings", None)
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            read_as(&mut client, "SELECT 1", None)
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invented_token_is_refused() {
+        let mut client = serve_with_auth(credentials()).await;
+
+        assert_eq!(
+            write_as(&mut client, "readings", Some("deadbeef"))
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_credentials_do_not_yield_a_token() {
+        let mut client = serve_with_auth(credentials()).await;
+
+        assert_eq!(
+            handshake(&mut client, "writer", "wrong")
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    /// §9: the grant is per table and per direction, checked against the table
+    /// the `do_put` descriptor names.
+    #[tokio::test]
+    async fn a_write_is_refused_on_an_ungranted_table() {
+        let mut client = serve_with_auth(credentials()).await;
+        let token = handshake(&mut client, "events-only", "pw").await.unwrap();
+
+        assert_eq!(
+            write_as(&mut client, "events", Some(&token))
+                .await
+                .expect("granted"),
+            1
+        );
+        assert_eq!(
+            write_as(&mut client, "readings", Some(&token))
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    /// §9: a reader may read what it was granted and write nothing.
+    #[tokio::test]
+    async fn a_reader_may_not_write() {
+        let mut client = serve_with_auth(credentials()).await;
+        let writer = handshake(&mut client, "writer", "s3cret").await.unwrap();
+        write_as(&mut client, "readings", Some(&writer))
+            .await
+            .unwrap();
+
+        let reader = handshake(&mut client, "reader", "hunter2").await.unwrap();
+
+        assert_eq!(
+            read_as(&mut client, "SELECT * FROM readings", Some(&reader))
+                .await
+                .expect("granted"),
+            1
+        );
+        assert_eq!(
+            write_as(&mut client, "readings", Some(&reader))
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    /// §9: the read grant is checked against the tables the *plan* reads, not
+    /// against the text — so a table reached through a view or a join is caught.
+    #[tokio::test]
+    async fn a_read_is_refused_on_a_table_reached_indirectly() {
+        let mut client = serve_with_auth(credentials()).await;
+        let writer = handshake(&mut client, "writer", "s3cret").await.unwrap();
+        write_as(&mut client, "readings", Some(&writer))
+            .await
+            .unwrap();
+        write_as(&mut client, "events", Some(&writer))
+            .await
+            .unwrap();
+
+        let reader = handshake(&mut client, "reader", "hunter2").await.unwrap();
+
+        // Granted directly.
+        assert!(
+            read_as(&mut client, "SELECT * FROM readings", Some(&reader))
+                .await
+                .is_ok()
+        );
+        // The history view of the same table is the same grant.
+        assert!(
+            read_as(
+                &mut client,
+                "SELECT * FROM \"readings$history\"",
+                Some(&reader)
+            )
+            .await
+            .is_ok(),
+            "a view of a granted table is not a separate object"
+        );
+        // And a join that reaches an ungranted one is refused whole.
+        assert_eq!(
+            read_as(
+                &mut client,
+                "SELECT * FROM readings JOIN events USING (metric_id)",
+                Some(&reader),
+            )
+            .await
+            .expect_err("must be refused")
+            .code(),
+            tonic::Code::PermissionDenied,
+        );
+    }
+
+    /// §9: describing data needs the same grant as reading it, or a schema
+    /// would leak a table's shape to a client that may not see its rows.
+    #[tokio::test]
+    async fn describing_an_ungranted_table_is_refused() {
+        let mut client = serve_with_auth(credentials()).await;
+        let writer = handshake(&mut client, "writer", "s3cret").await.unwrap();
+        write_as(&mut client, "events", Some(&writer))
+            .await
+            .unwrap();
+
+        let reader = handshake(&mut client, "reader", "hunter2").await.unwrap();
+        let descriptor = FlightDescriptor::new_cmd(
+            Query {
+                sql: "SELECT * FROM events".to_owned(),
+                as_of_micros: None,
+            }
+            .encode_to_vec(),
+        );
+
+        assert_eq!(
+            client
+                .get_schema(bearing(descriptor.clone(), &reader))
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            client
+                .get_flight_info(bearing(descriptor, &reader))
+                .await
+                .expect_err("must be refused")
+                .code(),
+            tonic::Code::PermissionDenied
         );
     }
 

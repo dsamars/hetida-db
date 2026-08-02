@@ -16,12 +16,15 @@ use arrow_flight::flight_service_server::FlightServiceServer;
 use tonic::transport::Server;
 
 use hetida_db::archive::{Archive, ArchiveConfig};
+use hetida_db::auth::{DEFAULT_TOKEN_TTL, SystemTokens, TokenIssuer};
 use hetida_db::clock::{Clock, SystemClock};
 use hetida_db::compact::{CompactConfig, Compactor, partition_dirs};
+use hetida_db::flight::BearerInterceptor;
 use hetida_db::flight::HetidaFlightService;
 use hetida_db::flush::{FlushConfig, FlushScheduler, Flusher};
 use hetida_db::parquet::ParquetConfig;
 use hetida_db::retention::Reaper;
+use hetida_db::serve::{AuthConfig, TransportConfig};
 use hetida_db::storage::FileStorage;
 
 /// Where the archive lives, unless `HETIDA_DATA_DIR` says otherwise.
@@ -235,16 +238,72 @@ async fn main() -> anyhow::Result<()> {
     let address = listen
         .parse()
         .with_context(|| format!("`{listen}` is not a socket address"))?;
-    println!("hetida-db: serving Arrow Flight on {address}");
 
-    Server::builder()
-        .add_service(FlightServiceServer::new(HetidaFlightService::new(
-            archive,
-            storage as Arc<_>,
-        )))
-        .serve_with_shutdown(address, shutdown())
-        .await
-        .context("the Flight server stopped with an error")?;
+    // §9: neither of these guesses. Serving in the clear, or serving anyone at
+    // all, is a decision an operator has to write down.
+    let transport = TransportConfig::resolve(|name| std::env::var(name).ok())
+        .context("the listener is not configured")?;
+    let auth = AuthConfig::resolve(|name| std::env::var(name).ok())
+        .context("authorization is not configured")?;
+
+    let mut server = Server::builder();
+    match &transport {
+        TransportConfig::Tls { certificate, key } => {
+            let identity = tonic::transport::Identity::from_pem(
+                std::fs::read(certificate)
+                    .with_context(|| format!("could not read {}", certificate.display()))?,
+                std::fs::read(key).with_context(|| format!("could not read {}", key.display()))?,
+            );
+            server = server
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .context("the TLS identity was refused")?;
+            println!("hetida-db: serving Arrow Flight over TLS on {address}");
+        }
+        TransportConfig::Plaintext => {
+            println!("hetida-db: serving Arrow Flight on {address}");
+            eprintln!(
+                "hetida-db: no TLS — a bearer token travels in a header, and \
+                 anyone on the path can read and replay it (§9)"
+            );
+        }
+    }
+
+    let serving = match auth {
+        AuthConfig::Users(credentials) => {
+            let issuer = Arc::new(TokenIssuer::new(
+                credentials,
+                Arc::new(SystemTokens),
+                Arc::new(SystemClock),
+                DEFAULT_TOKEN_TTL,
+            ));
+            let service = HetidaFlightService::with_auth(
+                Arc::clone(&archive),
+                Arc::clone(&storage) as Arc<_>,
+                Arc::clone(&issuer),
+            );
+            server
+                .add_service(FlightServiceServer::with_interceptor(
+                    service,
+                    BearerInterceptor::new(issuer),
+                ))
+                .serve_with_shutdown(address, shutdown())
+                .await
+        }
+        AuthConfig::Anonymous => {
+            eprintln!(
+                "hetida-db: no authorization — every caller may read and write \
+                 every table (§9)"
+            );
+            server
+                .add_service(FlightServiceServer::new(HetidaFlightService::new(
+                    Arc::clone(&archive),
+                    Arc::clone(&storage) as Arc<_>,
+                )))
+                .serve_with_shutdown(address, shutdown())
+                .await
+        }
+    };
+    serving.context("the Flight server stopped with an error")?;
 
     flushing.abort();
     compacting.abort();
