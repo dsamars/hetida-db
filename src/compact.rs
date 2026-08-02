@@ -44,7 +44,9 @@ use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record_batch};
 
 use crate::clock::Micros;
+use crate::instance::DATA_DIR;
 use crate::parquet::{ParquetConfig, WriteError, WrittenFile, read_partition, write_named};
+use crate::partition::PartitionInterval;
 use crate::registry::MetricId;
 use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN};
 use crate::seq::Seq;
@@ -156,14 +158,23 @@ impl Compactor {
     }
 
     /// Compacts `directory` if it is due, returning `None` if it is not.
+    ///
+    /// Entries that cannot be read are skipped rather than fatal, and are never
+    /// passed to [`Self::compact`] — so they are also never removed. That covers
+    /// two cases with one rule: a directory handed in by mistake (a level above
+    /// the partitions holds directories, not files), and a file an I/O error makes
+    /// unreadable, which must not be merged away while it cannot be verified.
     pub fn compact_if_due(
         &self,
         directory: &std::path::Path,
     ) -> Result<Option<Compaction>, CompactError> {
-        let files = self.storage.list(directory)?;
+        let mut files = Vec::new();
         let mut bytes = 0;
-        for file in &files {
-            bytes += self.storage.read(file)?.len();
+        for entry in self.storage.list(directory)? {
+            if let Ok(contents) = self.storage.read(&entry) {
+                bytes += contents.len();
+                files.push(entry);
+            }
         }
 
         if compaction_reason(self.config, files.len(), bytes).is_none() {
@@ -314,6 +325,31 @@ fn row_keys(batch: &RecordBatch) -> Result<Vec<(MetricId, Micros)>, CompactError
         .zip(timestamps.values().iter())
         .map(|(metric_id, timestamp)| (*metric_id, *timestamp))
         .collect())
+}
+
+/// Every partition directory of `table`, in path order.
+///
+/// Walks exactly [`PartitionInterval::depth`] levels below the table, so it
+/// returns partition directories rather than the year and month levels above
+/// them. A layout deeper or shallower than the recorded interval yields nothing
+/// at that depth, which is the shape the startup check exists to prevent (§11).
+pub fn partition_dirs(
+    storage: &dyn Storage,
+    table: &str,
+    interval: PartitionInterval,
+) -> Result<Vec<std::path::PathBuf>, CompactError> {
+    let mut level = vec![std::path::Path::new(DATA_DIR).join(table)];
+
+    for _ in 0..interval.depth() {
+        let mut next = Vec::new();
+        for directory in &level {
+            next.extend(storage.list(directory)?);
+        }
+        level = next;
+    }
+
+    level.sort();
+    Ok(level)
 }
 
 /// The `(metric_id, timestamp, seq)` triples a file holds, in file order.
@@ -662,6 +698,32 @@ mod tests {
 
     /// A failing store must not remove an input: the outputs are not durable, so
     /// removing them would lose rows outright.
+    /// An unreadable file must not be merged away while it cannot be verified,
+    /// and must not stop the readable ones from being compacted either.
+    #[test]
+    fn an_unreadable_entry_is_skipped_not_merged() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(1, 20, 1)], &[(1, 30, 2)]]);
+        // A directory sitting among the files: unreadable, and not a file.
+        write_partition(
+            &storage,
+            &dir().join("stray"),
+            &batch(&[(9, 99, 9)]),
+            ParquetConfig::default(),
+        )
+        .unwrap();
+
+        let result = compactor(&storage, eager())
+            .compact_if_due(&dir())
+            .expect("must not fail")
+            .expect("due");
+
+        assert_eq!(result.rows, 3, "only the readable files were merged");
+        assert!(
+            result.removed.iter().all(|path| !path.ends_with("stray")),
+            "the unreadable entry must not have been removed"
+        );
+    }
+
     #[test]
     fn a_failing_write_leaves_the_inputs_in_place() {
         let storage = with_files(&[&[(1, 10, 0)], &[(1, 20, 1)]]);
@@ -675,6 +737,70 @@ mod tests {
             storage.list(&dir()).unwrap(),
             before,
             "inputs must survive a failed compaction"
+        );
+    }
+
+    /// §11: the walk goes exactly as deep as the interval, so it finds partition
+    /// directories rather than the levels above them.
+    #[test]
+    fn partition_dirs_finds_directories_at_the_interval_depth() {
+        let storage = InMemoryStorage::new();
+        for month in ["08", "09"] {
+            write_partition(
+                &storage,
+                &PathBuf::from(format!("data/readings/year=2026/month={month}")),
+                &batch(&[(1, 10, 0)]),
+                ParquetConfig::default(),
+            )
+            .unwrap();
+        }
+
+        let found = partition_dirs(&storage, "readings", PartitionInterval::Month).unwrap();
+
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("data/readings/year=2026/month=08"),
+                PathBuf::from("data/readings/year=2026/month=09")
+            ]
+        );
+    }
+
+    /// A layout at a different depth yields nothing, which is why §11 validates
+    /// the interval at startup rather than guessing here.
+    #[test]
+    fn a_walk_at_the_wrong_depth_finds_nothing_useful() {
+        let storage = InMemoryStorage::new();
+        write_partition(
+            &storage,
+            &dir(),
+            &batch(&[(1, 10, 0)]),
+            ParquetConfig::default(),
+        )
+        .unwrap();
+
+        // The files are two levels down; looking one level down finds the year.
+        let shallow = partition_dirs(&storage, "readings", PartitionInterval::Year).unwrap();
+        assert_eq!(shallow, vec![PathBuf::from("data/readings/year=2026")]);
+
+        // Pointed at that level the compactor finds no readable files and does
+        // nothing, rather than failing on a directory it cannot read.
+        assert!(
+            compactor(&storage, eager())
+                .compact_if_due(&shallow[0])
+                .expect("must not fail on a directory")
+                .is_none(),
+            "a year directory holds directories, not files"
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_partitions_yields_none() {
+        let storage = InMemoryStorage::new();
+        assert!(
+            partition_dirs(&storage, "absent", PartitionInterval::Month)
+                .unwrap()
+                .is_empty()
         );
     }
 

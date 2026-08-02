@@ -17,6 +17,7 @@ use tonic::transport::Server;
 
 use hetida_db::archive::{Archive, ArchiveConfig};
 use hetida_db::clock::SystemClock;
+use hetida_db::compact::{CompactConfig, Compactor, partition_dirs};
 use hetida_db::flight::HetidaFlightService;
 use hetida_db::flush::{FlushConfig, FlushScheduler, Flusher};
 use hetida_db::parquet::ParquetConfig;
@@ -26,6 +27,12 @@ use hetida_db::storage::FileStorage;
 const DEFAULT_DATA_DIR: &str = "hetida-data";
 /// Address to serve on, unless `HETIDA_LISTEN` says otherwise.
 const DEFAULT_LISTEN: &str = "127.0.0.1:50051";
+/// How often the compactor looks for due partitions (§3).
+///
+/// Far less often than the flusher: compaction rewrites a whole partition, where
+/// a flush appends one file. Sharing the flusher's tick would either compact far
+/// more often than needed or flush far later than the age bound allows.
+const COMPACT_TICK: std::time::Duration = std::time::Duration::from_secs(300);
 /// How often the flusher looks for due partitions (§2).
 ///
 /// Far below the age bound it enforces, so a partition is flushed close to when
@@ -117,6 +124,51 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let compacting = tokio::spawn({
+        let archive = Arc::clone(&archive);
+        let storage = Arc::clone(&storage);
+        async move {
+            let mut timer = tokio::time::interval(COMPACT_TICK);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let compactor = Compactor::new(
+                Arc::clone(&storage) as Arc<_>,
+                CompactConfig::default(),
+                ParquetConfig::default(),
+            );
+
+            loop {
+                timer.tick().await;
+                for table in archive.catalogue().table_names() {
+                    let dirs = match partition_dirs(storage.as_ref(), &table, archive.interval()) {
+                        Ok(dirs) => dirs,
+                        Err(error) => {
+                            eprintln!("hetida-db: could not list `{table}` partitions: {error}");
+                            continue;
+                        }
+                    };
+                    for dir in dirs {
+                        match compactor.compact_if_due(&dir) {
+                            Ok(Some(done)) => println!(
+                                "hetida-db: compacted {} into {} file(s), {} rows",
+                                dir.display(),
+                                done.written.len(),
+                                done.rows
+                            ),
+                            Ok(None) => {}
+                            // A failed compaction changes nothing on disk: the
+                            // inputs are removed only once the outputs are
+                            // durable, so the partition is simply retried.
+                            Err(error) => eprintln!(
+                                "hetida-db: compacting {} failed, will retry: {error}",
+                                dir.display()
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     let address = listen
         .parse()
         .with_context(|| format!("`{listen}` is not a socket address"))?;
@@ -129,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         .context("the Flight server stopped with an error")?;
 
     flushing.abort();
+    compacting.abort();
     println!("hetida-db: stopped");
     Ok(())
 }
