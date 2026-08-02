@@ -33,6 +33,9 @@ dashmap = "6.2.1"
 # Stream combinators for the do_put/do_get streams; arrow-flight speaks in
 # `futures::Stream`, so this is its vocabulary rather than an extra choice.
 futures = "0.3"
+# Control-plane message types (§5), generated from proto/hetida.proto. Pinned to
+# the line arrow-flight resolves, since Flight's own messages use the same one.
+prost = "0.14"
 thiserror = "2"
 # Async runtime. Features kept to what the server needs: a multi-threaded
 # runtime, the test/main macros, TCP, and signal handling for shutdown.
@@ -51,3 +54,9 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 proptest = "1"
 tempfile = "3"
 tokio-stream = "0.1"
+
+[build-dependencies]
+# protox compiles the .proto in pure Rust, so cargo build needs no protoc
+# installed system-wide — prost-build's default path shells out to it.
+prost-build = "0.14"
+protox = "0.9"

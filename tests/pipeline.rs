@@ -428,3 +428,51 @@ fn a_restart_keeps_rejecting_a_type_change() {
         "a recorded schema must keep refusing a conflicting type after a restart"
     );
 }
+
+/// §5: the control-plane contract is Protobuf, generated from
+/// `proto/hetida.proto`. This pins that the generated types round-trip and that
+/// label order is not significant — a client sending labels in any order must
+/// name the same series the registry resolves (§10).
+#[test]
+fn the_control_plane_messages_round_trip() {
+    use hetida_db::proto::{Query, RegisterRequest, SeriesKey as ProtoKey};
+    use prost::Message;
+
+    let request = RegisterRequest {
+        series: vec![ProtoKey {
+            name: "temp".to_owned(),
+            labels: [
+                ("plant".to_owned(), "a".to_owned()),
+                ("line".to_owned(), "1".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        }],
+    };
+
+    let decoded = RegisterRequest::decode(request.encode_to_vec().as_slice()).expect("decodes");
+    assert_eq!(decoded, request);
+
+    // The wire form carries labels as a map, so the server canonicalises them
+    // into a SeriesKey rather than trusting the order they arrived in.
+    let sent = decoded.series.first().expect("one series");
+    let resolved = SeriesKey::new(
+        sent.name.clone(),
+        sent.labels.iter().map(|(k, v)| (k.clone(), v.clone())),
+    );
+    assert_eq!(
+        resolved,
+        series("temp", &[("line", "1"), ("plant", "a")]),
+        "the order labels arrive in must not change the series"
+    );
+
+    // An absent observation point means now — the current state (§1).
+    let query = Query {
+        sql: "select 1".to_owned(),
+        as_of_micros: None,
+    };
+    assert_eq!(
+        Query::decode(query.encode_to_vec().as_slice()).unwrap(),
+        query
+    );
+}

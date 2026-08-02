@@ -46,6 +46,22 @@ pub mod clock;
 pub mod instance;
 pub mod memtable;
 pub mod partition;
+
+/// Control-plane message types, generated from `proto/hetida.proto` (§5).
+///
+/// These carry the payloads of Arrow Flight's opaque byte fields — an action
+/// body, a `Ticket` — never time series data, which travels as Arrow
+/// `RecordBatch` over the streams. The `.proto` file is the client contract, so
+/// a client generates from it instead of reimplementing a byte layout.
+#[allow(
+    missing_docs,
+    clippy::doc_markdown,
+    clippy::derive_partial_eq_without_eq
+)]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/hetida.v1.rs"));
+}
+
 pub mod registry;
 pub mod schema;
 pub mod seq;

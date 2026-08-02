@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Heiko Dietz
+
+// Control-plane messages for hetida-db (§5).
+//
+// These carry the payloads of Arrow Flight's opaque byte fields: the body of a
+// `do_action` request and response, and the `Ticket` a `do_get` follows. Time
+// series data itself never appears here — it travels as Arrow `RecordBatch`
+// over the Flight streams, which the pure-Arrow rule requires.
+//
+// This file is the client contract. A client generates from it rather than
+// re-implementing a byte layout described in prose.
+
+syntax = "proto3";
+
+package hetida.v1;
+
+// One series identity: a metric name plus its complete label set (§10).
+message SeriesKey {
+  string name = 1;
+  // Order is not significant — the server canonicalises before resolving, so
+  // the same labels in any order name the same series.
+  map<string, string> labels = 2;
+}
+
+// Body of the `register` action: resolve these series to ids.
+//
+// Batched deliberately. Clients resolve once and cache (§10), so a client
+// starting up asks for everything it will ever write in one call.
+message RegisterRequest {
+  repeated SeriesKey series = 1;
+}
+
+// Response to `register`: one id per requested series, in request order.
+message RegisterResponse {
+  repeated uint64 metric_ids = 1;
+}
+
+// Payload of a `do_get` Ticket, and of the `cmd` a `get_flight_info`
+// descriptor carries (§5).
+message Query {
+  // SQL parsed by DataFusion.
+  string sql = 1;
+  // Observation point for as-of resolution (§1), in microseconds since the
+  // Unix epoch. Absent means now — the current state.
+  optional int64 as_of_micros = 2;
+}
