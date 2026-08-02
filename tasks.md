@@ -13,7 +13,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Introduce an injectable sequence source so `seq` ordering is deterministic under test (§1).
 - [x] Introduce a storage abstraction able to inject torn writes and I/O errors, so WAL recovery is tested deterministically instead of by killing processes (§4).
 - [x] Add `proptest` and set up the invariant suite in `tests/invariants.rs`, with the properties the Phase 0 foundation supports.
-- [ ] Carried to Phase 1 — the three §1 invariants describe components that do not exist yet: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression idempotent.
+- [ ] Carried to Phase 1 — suppression idempotence is now a property in `tests/invariants.rs`; the remaining two §1 invariants describe components that do not exist yet: version resolution at arbitrary observation points, and sort order surviving flush and compaction.
 
 ## Phase 1: Data Model & Ingestion Engine
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
@@ -23,7 +23,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
 - [x] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [x] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).
-- [ ] Implement retransmission suppression: discard an incoming version whose payload digest matches the current latest version of the same logical row, over a configured ingest-time window with a hard entry cap that survives freezes (§1). *The memtable-scoped form is in place; the window is not.*
+- [x] Implement retransmission suppression: discard an incoming version whose payload digest matches the current latest version of the same logical row, over a configured ingest-time window with a hard entry cap that survives freezes (§1).
 - [ ] Implement partition routing: split each incoming `RecordBatch` by the configured interval at insert time, since one batch may span interval boundaries (§3, §11).
 - [x] Implement freeze-and-swap so a flush never blocks ingestion: freeze the active `MemTable`, open a new one, hand the frozen one to the background writer (§2).
 - [x] Build append-only WAL with group commit (shared fsync, configurable max delay), per-record CRC, segment rotation, and checkpoint records for segment reclamation (§4).

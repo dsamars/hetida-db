@@ -22,6 +22,11 @@ arrow = "58.4"
 crc32fast = "1.5.0"
 dashmap = "6.2.1"
 thiserror = "2"
+# Payload digests for §1 retransmission suppression. Non-cryptographic is
+# sufficient: the comparison is not adversarial — a client constructing a
+# collision would only discard its own correction, which it could equally
+# achieve by not sending it.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 proptest = "1"

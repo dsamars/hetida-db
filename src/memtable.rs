@@ -17,6 +17,10 @@
 //! list. Global `(metric_id, timestamp, seq)` order is produced by
 //! [`MemTable::sorted`] at flush time, which is exactly where §1 wants it.
 //!
+//! Retransmission suppression compares against a [`SuppressionIndex`] the table
+//! only borrows. That state deliberately does not belong to the table: a freeze
+//! (§2) would reset it, and the §1 guarantee would then depend on flush timing.
+//!
 //! # Consistency
 //!
 //! The batch list and the index are updated in that order, without a shared
@@ -41,8 +45,11 @@ use dashmap::DashMap;
 
 use crate::clock::Micros;
 use crate::registry::MetricId;
-use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN, is_reserved};
+use crate::schema::{
+    METRIC_ID_COLUMN, SEQ_COLUMN, SYSTEM_TIME_COLUMN, TIMESTAMP_COLUMN, is_reserved,
+};
 use crate::seq::Seq;
+use crate::suppression::{PayloadDigest, SuppressionIndex, digest};
 
 /// Identity of a logical row (§1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,22 +101,6 @@ pub struct InsertOutcome {
     pub suppressed: usize,
 }
 
-/// One logical row: its versions, and what the newest of them holds.
-#[derive(Debug, Default)]
-struct LogicalRow {
-    /// Versions in `seq` order.
-    versions: Vec<VersionRef>,
-    /// Encoded payload of the highest-`seq` version, for §1 suppression.
-    latest_payload: Vec<u8>,
-}
-
-impl LogicalRow {
-    /// Highest `seq` held, if any.
-    fn max_seq(&self) -> Option<Seq> {
-        self.versions.last().map(|version| version.seq)
-    }
-}
-
 /// Buffers stamped batches, retaining every version.
 #[derive(Debug)]
 pub struct MemTable {
@@ -117,16 +108,23 @@ pub struct MemTable {
     payload_columns: Vec<usize>,
     encoder: RowConverter,
     batches: RwLock<Vec<RecordBatch>>,
-    index: DashMap<RowKey, LogicalRow>,
+    index: DashMap<RowKey, Vec<VersionRef>>,
+    suppression: Arc<SuppressionIndex>,
     writers: AtomicUsize,
 }
 
 impl MemTable {
     /// Creates an empty table accepting batches with this storage schema.
     ///
+    /// `suppression` is shared rather than owned, so it survives the freeze that
+    /// retires this table (§1).
+    ///
     /// Fails only if the payload columns cannot be row-encoded, which the
     /// suppression comparison depends on.
-    pub fn new(schema: SchemaRef) -> Result<Self, MemTableError> {
+    pub fn new(
+        schema: SchemaRef,
+        suppression: Arc<SuppressionIndex>,
+    ) -> Result<Self, MemTableError> {
         let payload_columns: Vec<usize> = schema
             .fields()
             .iter()
@@ -147,8 +145,14 @@ impl MemTable {
             encoder: RowConverter::new(sort_fields)?,
             batches: RwLock::new(Vec::new()),
             index: DashMap::new(),
+            suppression,
             writers: AtomicUsize::new(0),
         })
+    }
+
+    /// The suppression state this table compares against (§1).
+    pub fn suppression(&self) -> &Arc<SuppressionIndex> {
+        &self.suppression
     }
 
     /// Counter of writers currently inside this table.
@@ -189,9 +193,13 @@ impl MemTable {
 
         let keys = self.row_keys(batch)?;
         let seqs = self.u64_column(batch, SEQ_COLUMN)?.values().to_vec();
-        let payloads = self.encode_payloads(batch)?;
+        let digests = self.payload_digests(batch)?;
 
-        let keep = self.decide(&keys, &seqs, &payloads);
+        // Advance the window before anything is compared, so state older than
+        // the configured reach can no longer suppress a row (§1).
+        self.suppression.observe(self.batch_system_time(batch)?);
+
+        let keep = self.decide(&keys, &seqs, &digests);
         let kept = keep.iter().filter(|keep| **keep).count();
         let outcome = InsertOutcome {
             inserted: kept,
@@ -229,17 +237,18 @@ impl MemTable {
             };
             stored_row += 1;
 
-            let mut entry = self.index.entry(*key).or_default();
-            // Kept in `seq` order: arrival order is not version order, since a
-            // batch reserved earlier may be inserted later.
-            let at = entry.versions.partition_point(|held| held.seq < seq);
-            entry.versions.insert(at, version);
-            // The comparison target is the newest version, so an out-of-order
-            // arrival must not overwrite it.
-            if entry.max_seq() == Some(seq)
-                && let Some(payload) = payloads.get(row)
             {
-                entry.latest_payload = payload.clone();
+                let mut entry = self.index.entry(*key).or_default();
+                // Kept in `seq` order: arrival order is not version order, since
+                // a batch reserved earlier may be inserted later.
+                let at = entry.value().partition_point(|held| held.seq < seq);
+                entry.value_mut().insert(at, version);
+            }
+            // Recorded only after the row is actually stored, so a failure
+            // earlier cannot leave a digest standing for a version that does
+            // not exist — which would suppress a later, genuine write of it.
+            if let Some(digest) = digests.get(row).copied() {
+                self.suppression.record(*key, seq, digest);
             }
         }
 
@@ -248,61 +257,65 @@ impl MemTable {
 
     /// Decides which rows survive §1 retransmission suppression.
     ///
-    /// A row is discarded when its payload is byte-identical to the newest
-    /// version currently held for the same logical row. Rows earlier in the
-    /// same batch count towards that, so a batch repeated inside itself
-    /// collapses too.
-    fn decide(&self, keys: &[RowKey], seqs: &[Seq], payloads: &[Vec<u8>]) -> Vec<bool> {
+    /// A row is discarded when its payload digest matches the newest version
+    /// within reach for the same logical row — which spans freezes, because the
+    /// state does not belong to this table. Rows earlier in the same batch count
+    /// towards that, so a batch repeated inside itself collapses too.
+    fn decide(&self, keys: &[RowKey], seqs: &[Seq], digests: &[PayloadDigest]) -> Vec<bool> {
         // Tracks what each key's newest kept version holds while walking the
-        // batch, so the index is not mutated before the outcome is known.
-        let mut pending: HashMap<RowKey, (Seq, &[u8])> = HashMap::new();
+        // batch, so no state is mutated before the outcome is known.
+        let mut pending: HashMap<RowKey, (Seq, PayloadDigest)> = HashMap::new();
 
         keys.iter()
             .enumerate()
             .map(|(row, key)| {
                 let seq = seqs.get(row).copied().unwrap_or_default();
-                let Some(payload) = payloads.get(row) else {
+                let Some(digest) = digests.get(row).copied() else {
                     return false;
                 };
 
-                // The comparison happens inside the map guard's scope so no
-                // borrow of the index escapes into the loop body.
-                let (latest_seq, is_retransmission) = match pending.get(key) {
-                    Some((held_seq, held_payload)) => {
-                        (Some(*held_seq), *held_payload == payload.as_slice())
-                    }
-                    None => match self.index.get(key) {
-                        Some(entry) => (
-                            entry.max_seq(),
-                            entry.latest_payload.as_slice() == payload.as_slice(),
-                        ),
-                        None => (None, false),
-                    },
-                };
+                let newest = pending
+                    .get(key)
+                    .copied()
+                    .or_else(|| self.suppression.newest(*key));
 
-                if is_retransmission {
+                if newest.is_some_and(|(_, held)| held == digest) {
                     return false;
                 }
-                if latest_seq.is_none_or(|held| seq > held) {
-                    pending.insert(*key, (seq, payload.as_slice()));
+                if newest.is_none_or(|(held, _)| seq > held) {
+                    pending.insert(*key, (seq, digest));
                 }
                 true
             })
             .collect()
     }
 
-    /// Encodes each row's payload columns into comparable bytes.
+    /// Digests each row's payload columns for the §1 comparison.
     ///
     /// The system columns are excluded: they differ on every write by
-    /// construction, so including them would defeat suppression entirely.
-    fn encode_payloads(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, MemTableError> {
+    /// construction, so including them would defeat suppression entirely. The
+    /// row encoder supplies the canonical, type-aware byte form — nulls
+    /// included — and only its digest is retained, never the bytes.
+    fn payload_digests(&self, batch: &RecordBatch) -> Result<Vec<PayloadDigest>, MemTableError> {
         let columns: Vec<ArrayRef> = self
             .payload_columns
             .iter()
             .filter_map(|index| batch.columns().get(*index).cloned())
             .collect();
         let rows = self.encoder.convert_columns(&columns)?;
-        Ok(rows.iter().map(|row| row.as_ref().to_vec()).collect())
+        Ok(rows.iter().map(|row| digest(row.as_ref())).collect())
+    }
+
+    /// The `system_time` a batch was stamped with.
+    ///
+    /// Every row of a batch carries the same one (§1), so the first is the
+    /// batch's. This is the axis the suppression window advances on.
+    fn batch_system_time(&self, batch: &RecordBatch) -> Result<Micros, MemTableError> {
+        self.timestamp_column(batch, SYSTEM_TIME_COLUMN)?
+            .values()
+            .first()
+            .copied()
+            .ok_or_else(|| MemTableError::WrongColumnType(SYSTEM_TIME_COLUMN.to_owned()))
     }
 
     /// Reads the identity columns into logical row keys.
@@ -325,7 +338,7 @@ impl MemTable {
     pub fn versions(&self, key: RowKey) -> Vec<VersionRef> {
         self.index
             .get(&key)
-            .map(|entry| entry.versions.clone())
+            .map(|entry| entry.value().clone())
             .unwrap_or_default()
     }
 
@@ -333,7 +346,7 @@ impl MemTable {
     pub fn latest(&self, key: RowKey) -> Option<VersionRef> {
         self.index
             .get(&key)
-            .and_then(|entry| entry.versions.last().copied())
+            .and_then(|entry| entry.value().last().copied())
     }
 
     /// All versions in `(metric_id, timestamp, seq)` order — the flush order
@@ -342,7 +355,7 @@ impl MemTable {
         let mut all: Vec<VersionRef> = self
             .index
             .iter()
-            .flat_map(|entry| entry.value().versions.clone())
+            .flat_map(|entry| entry.value().clone())
             .collect();
         all.sort_unstable_by_key(|version| {
             (version.key.metric_id, version.key.timestamp, version.seq)
@@ -465,7 +478,7 @@ mod tests {
     }
 
     fn table() -> MemTable {
-        MemTable::new(storage_schema()).unwrap()
+        MemTable::new(storage_schema(), Arc::new(SuppressionIndex::default())).unwrap()
     }
 
     #[test]

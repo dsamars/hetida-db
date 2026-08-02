@@ -18,11 +18,11 @@
 //!
 //! # Suppression scope
 //!
-//! Retransmission suppression (§1) compares against the newest version the
-//! *active* table holds. A freeze resets that history, so a retransmission
-//! arriving after the flush of the version it duplicates is not recognised.
-//! §1 does not say how far back suppression must reach; this is the open edge
-//! of that decision.
+//! Retransmission suppression (§1) must reach across a freeze: the comparison
+//! state lives in a [`SuppressionIndex`] this holder owns and lends to every
+//! table it installs, so retiring a table does not reset it. Its reach is the
+//! configured ingest-time window, not the lifetime of a table — that is what
+//! keeps the guarantee independent of flush timing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,22 +32,41 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
 use crate::memtable::{InsertOutcome, MemTable, MemTableError};
+use crate::suppression::SuppressionIndex;
 
 /// Holds the table currently accepting writes and swaps it out on flush.
 #[derive(Debug)]
 pub struct ActiveMemTable {
     schema: SchemaRef,
+    suppression: Arc<SuppressionIndex>,
     current: ArcSwap<MemTable>,
 }
 
 impl ActiveMemTable {
-    /// Creates a holder with a fresh, empty table.
+    /// Creates a holder with a fresh, empty table and the default reach (§1).
     pub fn new(schema: SchemaRef) -> Result<Self, MemTableError> {
-        let table = MemTable::new(Arc::clone(&schema))?;
+        Self::with_suppression(schema, Arc::new(SuppressionIndex::default()))
+    }
+
+    /// Creates a holder comparing against `suppression`.
+    ///
+    /// The index outlives every table installed here, which is what lets a
+    /// retransmission arriving after a freeze still be recognised (§1).
+    pub fn with_suppression(
+        schema: SchemaRef,
+        suppression: Arc<SuppressionIndex>,
+    ) -> Result<Self, MemTableError> {
+        let table = MemTable::new(Arc::clone(&schema), Arc::clone(&suppression))?;
         Ok(Self {
             schema,
+            suppression,
             current: ArcSwap::from_pointee(table),
         })
+    }
+
+    /// The suppression state shared by every table this holder installs.
+    pub fn suppression(&self) -> &Arc<SuppressionIndex> {
+        &self.suppression
     }
 
     /// The table currently accepting writes.
@@ -79,7 +98,12 @@ impl ActiveMemTable {
     /// Returns only once no writer remains inside the retired table, so the
     /// caller receives a table nothing can still be appending to.
     pub fn freeze(&self) -> Result<Arc<MemTable>, MemTableError> {
-        let replacement = Arc::new(MemTable::new(Arc::clone(&self.schema))?);
+        // The replacement borrows the same suppression state, so the retired
+        // table's comparison history is not lost with it (§1).
+        let replacement = Arc::new(MemTable::new(
+            Arc::clone(&self.schema),
+            Arc::clone(&self.suppression),
+        )?);
         let retired = self.current.swap(replacement);
 
         while retired.writers_in_flight() > 0 {
@@ -122,7 +146,9 @@ mod tests {
     use arrow::array::{Float64Array, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
+    use crate::clock::Micros;
     use crate::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, append_system_fields, timestamp_type};
+    use crate::suppression::SuppressionConfig;
 
     fn storage_schema() -> SchemaRef {
         append_system_fields(&Schema::new(vec![
@@ -253,6 +279,152 @@ mod tests {
         let total: usize = tables.iter().map(|table| table.num_rows()).sum();
         assert_eq!(total, (WRITERS * PER_WRITER) as usize);
         assert_eq!(active.current().num_rows(), 0);
+    }
+
+    /// Builds a stamped single row with an explicit payload value and
+    /// `system_time` — the axis the suppression window advances on (§1).
+    fn at(
+        metric_id: u64,
+        timestamp: i64,
+        seq: u64,
+        value: f64,
+        system_time: Micros,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            storage_schema(),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![timestamp])),
+                Arc::new(UInt64Array::from(vec![metric_id])),
+                Arc::new(Float64Array::from(vec![value])),
+                Arc::new(TimestampMicrosecondArray::from(vec![system_time])),
+                Arc::new(UInt64Array::from(vec![seq])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Builds a stamped single row with an explicit payload value.
+    fn valued(metric_id: u64, timestamp: i64, seq: u64, value: f64) -> RecordBatch {
+        at(metric_id, timestamp, seq, value, 100)
+    }
+
+    /// Holder with an explicit reach, for the window and cap properties.
+    fn active_with(window: Micros, max_entries: usize) -> ActiveMemTable {
+        ActiveMemTable::with_suppression(
+            storage_schema(),
+            Arc::new(SuppressionIndex::new(SuppressionConfig {
+                window,
+                max_entries,
+            })),
+        )
+        .unwrap()
+    }
+
+    /// §1: suppression reaches across a freeze. Tying it to the active table
+    /// made the guarantee depend on flush timing, which no client can observe.
+    #[test]
+    fn a_retransmission_after_a_freeze_is_suppressed() {
+        let active = active();
+        active.insert(&valued(1, 10, 0, 1.5)).unwrap();
+        let frozen = active.freeze().unwrap();
+
+        let outcome = active.insert(&valued(1, 10, 1, 1.5)).unwrap();
+
+        assert_eq!(outcome.suppressed, 1, "the retry duplicates a frozen row");
+        assert_eq!(outcome.inserted, 0);
+        assert_eq!(frozen.num_rows(), 1);
+        assert_eq!(active.current().num_rows(), 0);
+    }
+
+    /// §1: a correction is never discarded, freeze or not. Suppression may only
+    /// ever drop an identical payload.
+    #[test]
+    fn a_correction_after_a_freeze_is_kept() {
+        let active = active();
+        active.insert(&valued(1, 10, 0, 1.5)).unwrap();
+        active.freeze().unwrap();
+
+        let outcome = active.insert(&valued(1, 10, 1, 2.5)).unwrap();
+
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(outcome.suppressed, 0);
+    }
+
+    /// §1: the reach does not depend on flush timing, so no number of freezes
+    /// inside the window may reset it.
+    #[test]
+    fn repeated_freezes_inside_the_window_do_not_reset_suppression() {
+        let active = active();
+        active.insert(&valued(1, 10, 0, 1.5)).unwrap();
+        for _ in 0..20 {
+            active.freeze().unwrap();
+        }
+
+        assert_eq!(active.insert(&valued(1, 10, 1, 1.5)).unwrap().suppressed, 1);
+    }
+
+    /// §1: past the window the same retry becomes a new version. The boundary is
+    /// the configured window — a documented limit, not an accident of flushing.
+    #[test]
+    fn a_retransmission_past_the_window_is_not_suppressed() {
+        const WINDOW: Micros = 1_000;
+
+        let active = active_with(WINDOW, 1_000_000);
+        active.insert(&at(1, 10, 0, 1.5, 5_000)).unwrap();
+        active.freeze().unwrap();
+
+        // Ingest time passes, carried by the data itself rather than a clock.
+        active.insert(&at(2, 99, 1, 0.0, 5_000 + WINDOW)).unwrap();
+        let outcome = active
+            .insert(&at(1, 10, 2, 1.5, 5_000 + 2 * WINDOW))
+            .unwrap();
+
+        assert_eq!(
+            outcome.inserted, 1,
+            "beyond the reach a repeat is a new version"
+        );
+    }
+
+    /// §7: an exhausted entry cap shortens the reach. What it must never do is
+    /// discard a correction.
+    #[test]
+    fn an_exhausted_entry_cap_never_discards_a_correction() {
+        let active = active_with(Micros::MAX, 2);
+
+        for row in 0..50i64 {
+            active.insert(&valued(1, row, row as u64, 1.5)).unwrap();
+            active.freeze().unwrap();
+        }
+
+        assert!(
+            active.suppression().forced_rotations() > 0,
+            "the cap must report having bound the reach"
+        );
+        assert_eq!(active.insert(&valued(1, 49, 100, 9.5)).unwrap().inserted, 1);
+    }
+
+    /// §1, §4: the window advances on the data's own `system_time`, so feeding
+    /// the same stamped batches to a fresh instance — which is what WAL replay
+    /// does — reaches exactly the same decisions.
+    #[test]
+    fn replaying_the_same_batches_reaches_the_same_decisions() {
+        let batches = [
+            at(1, 10, 0, 1.5, 1_000),
+            at(1, 10, 1, 1.5, 2_000), // retransmission
+            at(1, 10, 2, 2.5, 3_000), // correction
+        ];
+        let run = || -> Vec<InsertOutcome> {
+            let active = active();
+            batches
+                .iter()
+                .map(|batch| active.insert(batch).unwrap())
+                .collect()
+        };
+
+        let first = run();
+        assert_eq!(first[1].suppressed, 1, "the retry must be recognised");
+        assert_eq!(first[2].inserted, 1, "the correction must survive");
+        assert_eq!(run(), first, "replay reached different decisions");
     }
 
     /// The guard must not outlive the swap: once `freeze` returns, no writer
