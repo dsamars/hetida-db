@@ -35,9 +35,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
-use arrow::compute::filter_record_batch;
+use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::row::{RowConverter, SortField};
@@ -363,6 +363,53 @@ impl MemTable {
         all
     }
 
+    /// Every version in one batch, ordered by `(metric_id, timestamp, seq)`.
+    ///
+    /// This is the flush path, the one place re-batching is permitted: the
+    /// buffered batches are concatenated and reordered into the single sorted
+    /// batch every Parquet file must hold (§1, §2). Version resolution is a
+    /// streaming merge over that order and silently degrades to a full sort if it
+    /// is broken, so producing it here rather than trusting insertion order is
+    /// the point.
+    ///
+    /// `None` if nothing is buffered — an empty table has no batch to write.
+    pub fn sorted_batch(&self) -> Result<Option<RecordBatch>, MemTableError> {
+        let versions = self.sorted();
+        if versions.is_empty() {
+            return Ok(None);
+        }
+
+        let batches = self.read_batches();
+        // Where each buffered batch starts once they are laid end to end, so a
+        // `(batch, row)` reference becomes one index into the concatenation.
+        let mut offsets = Vec::with_capacity(batches.len());
+        let mut running = 0usize;
+        for batch in batches.iter() {
+            offsets.push(running);
+            running += batch.num_rows();
+        }
+
+        let indices: UInt32Array = versions
+            .iter()
+            .map(|version| {
+                offsets
+                    .get(version.batch)
+                    .and_then(|offset| offset.checked_add(version.row))
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .collect();
+        if indices.null_count() > 0 {
+            // A reference pointing outside the buffer would silently drop a
+            // version, which §1 forbids outright.
+            return Err(MemTableError::WrongColumnType(
+                "version reference outside the buffered batches".to_owned(),
+            ));
+        }
+
+        let concatenated = concat_batches(&self.schema, batches.iter())?;
+        Ok(Some(take_record_batch(&concatenated, &indices)?))
+    }
+
     /// A buffered batch by index, as referenced by [`VersionRef::batch`].
     pub fn batch(&self, index: usize) -> Option<RecordBatch> {
         self.read_batches().get(index).cloned()
@@ -425,7 +472,13 @@ impl MemTable {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable
+)]
 mod tests {
     use super::*;
     use std::sync::Arc;

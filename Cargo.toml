@@ -25,6 +25,7 @@ arrow = "58.4"
 # The wire protocol (§5). Same Arrow version as above, by the rule in that
 # comment: it exchanges Arrow types across the crate boundary.
 arrow-flight = "58.4"
+bytes = "1"
 # Calendar arithmetic for the Hive-style partition layout (§11). Pinned to the
 # version arrow already resolves, so only one chrono is in the graph.
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
@@ -33,6 +34,9 @@ dashmap = "6.2.1"
 # Stream combinators for the do_put/do_get streams; arrow-flight speaks in
 # `futures::Stream`, so this is its vocabulary rather than an extra choice.
 futures = "0.3"
+# The archive format. Same Arrow version as above, by the rule in that comment:
+# it writes Arrow types straight to disk.
+parquet = { version = "58.4", features = ["zstd"] }
 # Control-plane message types (§5), generated from proto/hetida.proto. Pinned to
 # the line arrow-flight resolves, since Flight's own messages use the same one.
 prost = "0.14"

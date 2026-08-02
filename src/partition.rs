@@ -166,7 +166,13 @@ fn datetime(timestamp: Micros) -> Result<NaiveDateTime, PartitionError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable
+)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

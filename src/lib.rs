@@ -24,7 +24,8 @@
 //! ([`wal`]), the partition layout ([`partition`]), the routing that places a
 //! batch in it ([`table`]), the startup sequence that assembles all of it
 //! ([`archive`]) and the Flight surface serving it ([`flight`]), with batches
-//! made durable through the data log ([`data_log`]).
+//! made durable through the data log ([`data_log`]) and archived as Parquet
+//! ([`parquet`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -48,6 +49,7 @@ pub mod data_log;
 pub mod flight;
 pub mod instance;
 pub mod memtable;
+pub mod parquet;
 pub mod partition;
 
 /// Control-plane message types, generated from `proto/hetida.proto` (§5).

@@ -32,7 +32,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Implement backpressure: acknowledgements produced lazily so gRPC flow control carries the pressure back, plus `RESOURCE_EXHAUSTED` past the hard `MemTable` memory cap (§7).
 
 ## Phase 2: Parquet Storage & Archiver
-- [ ] Implement Parquet writer with ZSTD compression and explicit Min/Max column index generation, including `system_time` so old observation points can skip whole row groups (§1).
+- [x] Implement Parquet writer with ZSTD compression and page-level statistics on every column, `system_time` included, so old observation points skip whole row groups (§1). *Refuses an unsorted batch rather than sorting it; declares its sort order in the footer.*
 - [x] Implement the parameterised Hive-style partitioner for the `hour`/`day`/`month`/`year` intervals, taking the interval as an argument rather than a global (§11). *Pulled forward: partition routing in Phase 1 cannot derive a path without it.*
 - [x] Persist the partition interval in the instance metadata at initialisation and validate it against the on-disk layout at startup, refusing to start on a mismatch (§11). *Also refuses when partitions exist but the metadata is gone, since the layout cannot then be inferred.*
 - [ ] Build background flusher transferring frozen `MemTable`s to Parquet, triggered per partition by size cap or max age — whichever fires first — writing `part-<seq>.parquet` sorted by `(metric_id, timestamp, seq)` with all versions preserved (§1, §2, §3).

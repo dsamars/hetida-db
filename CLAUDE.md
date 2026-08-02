@@ -42,7 +42,7 @@ Development is strictly test-driven. This is not a style preference — it const
 - **Storage abstraction with fault injection.** WAL recovery is tested by injecting torn writes and I/O errors, not by killing processes. A crash test that cannot be reproduced deterministically is not a test.
 - **Deterministic tests only.** No `sleep`, no wall-clock assertions, no fixed ports. Use `tokio::time::pause()` for time-dependent async paths and port 0 for servers. A flaky test is treated as a failing test.
 - **Property-based tests (`proptest`) for the invariants**, because examples cannot cover them: version resolution at arbitrary observation points, sort order surviving flush and compaction, retransmission suppression being idempotent.
-- **Test layout:** unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`. Test modules carry `#[allow(clippy::unwrap_used, clippy::expect_used)]` — the zero-panic policy applies to production code, and tests may panic freely.
+- **Test layout:** unit tests in `#[cfg(test)] mod tests` beside the code, cross-component tests in `tests/`. Test modules carry `#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unreachable)]` — the zero-panic policy applies to production code, and tests may panic freely. Production code denies all five, so an `unreachable!` in the ingest path fails the build like an `unwrap` does.
 - **Benchmarks are not tests.** Phase 4 measures; correctness is settled long before it.
 
 ## Tech Stack

@@ -231,7 +231,13 @@ fn masks_by_partition(starts: &[Micros]) -> BTreeMap<Micros, Vec<bool>> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable
+)]
 mod tests {
     use super::*;
 
