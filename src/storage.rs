@@ -79,6 +79,15 @@ pub trait Storage: fmt::Debug + Send + Sync {
 
     /// Deletes an object. Removing an absent object succeeds.
     fn remove(&self, path: &Path) -> StorageResult<()>;
+
+    /// Moves `from` onto `to`, replacing `to` if it exists.
+    ///
+    /// Atomic: a reader sees either the old object or the whole new one, never a
+    /// partial write. This is what lets a Parquet file be published only once its
+    /// footer is there — [`Storage::open_append`] makes a name visible
+    /// immediately, so writing under the final name would expose a half file
+    /// that a reader would try to open.
+    fn rename(&self, from: &Path, to: &Path) -> StorageResult<()>;
 }
 
 /// Append handle onto a single object.
@@ -188,6 +197,16 @@ impl Storage for InMemoryStorage {
 
         listed.dedup();
         Ok(listed)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> StorageResult<()> {
+        let mut guard = self.lock();
+        let bytes = guard
+            .objects
+            .remove(from)
+            .ok_or_else(|| StorageError::NotFound(from.to_path_buf()))?;
+        guard.objects.insert(to.to_path_buf(), bytes);
+        Ok(())
     }
 
     fn remove(&self, path: &Path) -> StorageResult<()> {
@@ -302,6 +321,15 @@ impl Storage for FileStorage {
         }
         listed.sort();
         Ok(listed)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> StorageResult<()> {
+        let source = self.resolve(from);
+        let target = self.resolve(to);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| StorageError::from_io(parent, e))?;
+        }
+        fs::rename(&source, &target).map_err(|e| StorageError::from_io(&source, e))
     }
 
     fn remove(&self, path: &Path) -> StorageResult<()> {

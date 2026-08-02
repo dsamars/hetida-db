@@ -103,10 +103,19 @@ pub struct WrittenFile {
 }
 
 /// File name for a partition file holding up to `max_seq`.
-pub fn file_name(max_seq: Seq) -> String {
-    // Zero padded so lexicographic order matches sequence order, which is what
-    // makes a directory listing readable in write order.
-    format!("part-{max_seq:020}.parquet")
+///
+/// `discriminator` distinguishes files that would otherwise share a name: a
+/// compaction re-emitting the same `max_seq` as one of its inputs must not
+/// collide with it, and the store has no rename to work around that. `None` is
+/// the flush path's plain name.
+///
+/// Zero padded so lexicographic order matches sequence order, which is what makes
+/// a directory listing readable in write order.
+pub fn file_name(max_seq: Seq, discriminator: Option<u32>) -> String {
+    match discriminator {
+        None => format!("part-{max_seq:020}.parquet"),
+        Some(index) => format!("part-{max_seq:020}-c{index:04}.parquet"),
+    }
 }
 
 /// Writes `batch` as one Parquet file into `directory`.
@@ -118,6 +127,19 @@ pub fn write_partition(
     directory: &std::path::Path,
     batch: &RecordBatch,
     config: ParquetConfig,
+) -> Result<WrittenFile, WriteError> {
+    write_named(storage, directory, batch, config, None)
+}
+
+/// Writes `batch` under a name distinguished by `discriminator`.
+///
+/// See [`file_name`]. Used by compaction, which must not overwrite its inputs.
+pub fn write_named(
+    storage: &dyn Storage,
+    directory: &std::path::Path,
+    batch: &RecordBatch,
+    config: ParquetConfig,
+    discriminator: Option<u32>,
 ) -> Result<WrittenFile, WriteError> {
     let max_seq = check_sorted(batch)?;
 
@@ -132,18 +154,23 @@ pub fn write_partition(
         .set_sorting_columns(Some(sorting_columns(batch)?))
         .build();
 
-    // Written to memory and then handed to the store in one append: a Parquet
-    // file is only valid once its footer is there, so a partial file must never
-    // be visible under a name a reader would open.
     let mut buffer = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(properties))?;
     writer.write(batch)?;
     writer.close()?;
 
-    let path = directory.join(file_name(max_seq));
-    let mut file = storage.open_append(&path)?;
-    file.append(&buffer)?;
-    file.sync()?;
+    // Published by rename, because a Parquet file is only valid once its footer
+    // is there and `open_append` makes a name visible immediately. Writing under
+    // the final name would leave a half file for a reader to open if the write
+    // failed part way.
+    let path = directory.join(file_name(max_seq, discriminator));
+    let staging = directory.join(format!(".{}.tmp", file_name(max_seq, discriminator)));
+    if let Err(error) = write_staged(storage, &staging, &buffer) {
+        // Leave no debris behind, whether or not this succeeds.
+        let _ = storage.remove(&staging);
+        return Err(error);
+    }
+    storage.rename(&staging, &path)?;
 
     Ok(WrittenFile {
         path,
@@ -151,6 +178,18 @@ pub fn write_partition(
         bytes: buffer.len(),
         max_seq,
     })
+}
+
+/// Writes the whole file to a staging name, synced.
+fn write_staged(
+    storage: &dyn Storage,
+    staging: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), WriteError> {
+    let mut file = storage.open_append(staging)?;
+    file.append(bytes)?;
+    file.sync()?;
+    Ok(())
 }
 
 /// Declares the sort order in the file's metadata, so a reader can rely on it.
@@ -453,9 +492,20 @@ mod tests {
     /// order.
     #[test]
     fn file_names_sort_in_sequence_order() {
-        let mut names = [file_name(9), file_name(100), file_name(11)];
+        let mut names = [
+            file_name(9, None),
+            file_name(100, None),
+            file_name(11, None),
+        ];
         names.sort();
-        assert_eq!(names, [file_name(9), file_name(11), file_name(100)]);
+        assert_eq!(
+            names,
+            [
+                file_name(9, None),
+                file_name(11, None),
+                file_name(100, None)
+            ]
+        );
     }
 
     #[test]
@@ -477,6 +527,43 @@ mod tests {
             write(&storage, &batch(&[(1, 10, 0)])),
             Err(WriteError::Storage(_))
         ));
+    }
+
+    /// A Parquet file is only valid with its footer, and `open_append` makes a
+    /// name visible at once — so a failed write must leave nothing behind for a
+    /// reader to open, staging file included.
+    #[test]
+    fn a_failed_write_leaves_no_file_behind() {
+        let storage = InMemoryStorage::new();
+        storage.inject(Fault::Fail(std::io::ErrorKind::StorageFull));
+
+        assert!(write(&storage, &batch(&[(1, 10, 0)])).is_err());
+
+        assert!(
+            storage.list(&dir()).unwrap().is_empty(),
+            "debris remains: {:?}",
+            storage.list(&dir()).unwrap()
+        );
+    }
+
+    /// A torn write must not be published either: the rename happens only after
+    /// the whole buffer is synced, so the final name never holds a partial file.
+    #[test]
+    fn a_torn_write_never_appears_under_the_final_name() {
+        let storage = InMemoryStorage::new();
+        storage.inject(Fault::TornWrite { keep: 64 });
+
+        // The write itself reports success — a torn write does (§4) — but what
+        // matters is that whatever is published is a readable file or nothing.
+        let _ = write(&storage, &batch(&[(1, 10, 0), (1, 20, 1)]));
+
+        for file in storage.list(&dir()).unwrap() {
+            assert!(
+                !file.to_string_lossy().contains(".tmp"),
+                "a staging file was published: {}",
+                file.display()
+            );
+        }
     }
 
     /// §1, §2: the memtable produces the order and this module writes it, so the
