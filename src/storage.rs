@@ -66,6 +66,24 @@ pub trait Storage: fmt::Debug + Send + Sync {
     /// Reads an object in full.
     fn read(&self, path: &Path) -> StorageResult<Vec<u8>>;
 
+    /// Reads `range` of an object, clamped to its end.
+    ///
+    /// A Parquet reader opens a file by fetching its footer and then only the
+    /// column chunks the query needs (§5, §11). Serving those from a full read
+    /// each time would make a scan quadratic in the file size, so this is the
+    /// operation the query path uses and `read` is not.
+    ///
+    /// A range starting past the end yields no bytes rather than failing: that
+    /// is what a reader asking beyond a shorter-than-expected object should see.
+    fn read_range(&self, path: &Path, range: std::ops::Range<u64>) -> StorageResult<Vec<u8>>;
+
+    /// Size of an object in bytes, or `None` if `path` is not one.
+    ///
+    /// `None` covers both an absent path and a directory, which is exactly the
+    /// distinction a walk over the layout needs: an entry with a size is a file
+    /// to scan, an entry without one is a level to descend into (§11).
+    fn size(&self, path: &Path) -> StorageResult<Option<u64>>;
+
     /// Lists entries directly beneath `prefix`, sorted by path.
     ///
     /// Directory semantics, as `read_dir` has them: an object nested deeper is
@@ -189,6 +207,28 @@ impl Storage for InMemoryStorage {
             .get(path)
             .cloned()
             .ok_or_else(|| StorageError::NotFound(path.to_path_buf()))
+    }
+
+    fn read_range(&self, path: &Path, range: std::ops::Range<u64>) -> StorageResult<Vec<u8>> {
+        let bytes = self.read(path)?;
+        let start = usize::try_from(range.start)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let end = usize::try_from(range.end)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        Ok(bytes
+            .get(start..end.max(start))
+            .unwrap_or_default()
+            .to_vec())
+    }
+
+    fn size(&self, path: &Path) -> StorageResult<Option<u64>> {
+        Ok(self
+            .lock()
+            .objects
+            .get(path)
+            .map(|bytes| bytes.len() as u64))
     }
 
     fn list(&self, prefix: &Path) -> StorageResult<Vec<PathBuf>> {
@@ -333,6 +373,34 @@ impl Storage for FileStorage {
     fn read(&self, path: &Path) -> StorageResult<Vec<u8>> {
         let resolved = self.resolve(path);
         fs::read(&resolved).map_err(|e| StorageError::from_io(&resolved, e))
+    }
+
+    fn read_range(&self, path: &Path, range: std::ops::Range<u64>) -> StorageResult<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let resolved = self.resolve(path);
+        let mut file = File::open(&resolved).map_err(|e| StorageError::from_io(&resolved, e))?;
+        file.seek(SeekFrom::Start(range.start))
+            .map_err(|e| StorageError::from_io(&resolved, e))?;
+
+        // `take` clamps at the end of the file, so a range reaching past it
+        // yields what is there rather than failing on a short read.
+        let mut bytes = Vec::new();
+        file.take(range.end.saturating_sub(range.start))
+            .read_to_end(&mut bytes)
+            .map_err(|e| StorageError::from_io(&resolved, e))?;
+        Ok(bytes)
+    }
+
+    fn size(&self, path: &Path) -> StorageResult<Option<u64>> {
+        let resolved = self.resolve(path);
+        match fs::metadata(&resolved) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            // A directory is not an object, and neither is an absent path.
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::from_io(&resolved, e)),
+        }
     }
 
     fn list(&self, prefix: &Path) -> StorageResult<Vec<PathBuf>> {
@@ -573,6 +641,81 @@ mod tests {
         assert!(storage.list(Path::new("wal")).unwrap().is_empty());
     }
 
+    /// §5: a Parquet reader opens a file by reading its footer and then the
+    /// column chunks it needs. Reading the whole object for each of those would
+    /// make a scan quadratic in the file size, so the store answers ranges.
+    #[test]
+    fn a_range_reads_only_the_bytes_asked_for() {
+        let storage = InMemoryStorage::new();
+        let mut file = storage.open_append(Path::new("data/part-0")).unwrap();
+        file.append(b"0123456789").unwrap();
+        file.sync().unwrap();
+
+        assert_eq!(
+            storage.read_range(Path::new("data/part-0"), 2..5).unwrap(),
+            b"234"
+        );
+        assert_eq!(
+            storage.read_range(Path::new("data/part-0"), 8..10).unwrap(),
+            b"89",
+            "a range reaching the end must be whole"
+        );
+    }
+
+    /// Clamped rather than failing: a reader asking past the end gets what is
+    /// there, which is what a short object at the tail of a range looks like.
+    #[test]
+    fn a_range_past_the_end_is_clamped() {
+        let storage = InMemoryStorage::new();
+        let mut file = storage.open_append(Path::new("data/part-0")).unwrap();
+        file.append(b"abc").unwrap();
+        file.sync().unwrap();
+
+        assert_eq!(
+            storage.read_range(Path::new("data/part-0"), 1..99).unwrap(),
+            b"bc"
+        );
+        assert!(
+            storage
+                .read_range(Path::new("data/part-0"), 9..99)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_range_of_a_missing_object_reports_not_found() {
+        let storage = InMemoryStorage::new();
+        assert!(matches!(
+            storage.read_range(Path::new("absent"), 0..1),
+            Err(StorageError::NotFound(_))
+        ));
+    }
+
+    /// §5: the scan needs each file's size to plan its reads, and needs to tell
+    /// a file from a directory while walking the layout. One answer does both:
+    /// a directory has no size.
+    #[test]
+    fn size_reports_objects_and_denies_directories() {
+        let storage = InMemoryStorage::new();
+        let mut file = storage
+            .open_append(Path::new("data/year=2026/part-0"))
+            .unwrap();
+        file.append(b"12345").unwrap();
+        file.sync().unwrap();
+
+        assert_eq!(
+            storage.size(Path::new("data/year=2026/part-0")).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            storage.size(Path::new("data/year=2026")).unwrap(),
+            None,
+            "a directory is not an object"
+        );
+        assert_eq!(storage.size(Path::new("absent")).unwrap(), None);
+    }
+
     /// §8: retention drops a whole partition directory. Removing the files one
     /// by one would leave the directory behind, and the archive's shape is its
     /// directory listing (§11).
@@ -714,6 +857,41 @@ mod file_tests {
             storage.list(Path::new("wal")).unwrap(),
             vec![PathBuf::from("wal/000002")]
         );
+    }
+
+    /// The double is only useful if the real store answers ranges and sizes the
+    /// same way (§5).
+    #[test]
+    fn file_storage_reads_ranges_and_reports_sizes() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let storage = FileStorage::new(root.path());
+        let mut file = storage.open_append(Path::new("data/y=1/part-0")).unwrap();
+        file.append(b"0123456789").unwrap();
+        file.sync().unwrap();
+
+        assert_eq!(
+            storage
+                .read_range(Path::new("data/y=1/part-0"), 2..5)
+                .unwrap(),
+            b"234"
+        );
+        assert_eq!(
+            storage
+                .read_range(Path::new("data/y=1/part-0"), 8..99)
+                .unwrap(),
+            b"89",
+            "a range past the end must clamp, not fail"
+        );
+        assert_eq!(
+            storage.size(Path::new("data/y=1/part-0")).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            storage.size(Path::new("data/y=1")).unwrap(),
+            None,
+            "a directory is not an object"
+        );
+        assert_eq!(storage.size(Path::new("data/absent")).unwrap(), None);
     }
 
     /// The in-memory double is only useful if the real store drops a directory

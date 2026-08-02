@@ -26,7 +26,9 @@
 //! ([`archive`]) and the Flight surface serving it ([`flight`]), with batches
 //! made durable through the data log ([`data_log`]) and archived as Parquet
 //! ([`parquet`]) by the flusher ([`flush`]), merged by the compactor
-//! ([`compact`]) and expired by the reaper ([`retention`]).
+//! ([`compact`]) and expired by the reaper ([`retention`]), and with the whole
+//! archive queryable through DataFusion ([`query`]) over a scan that spans
+//! memory and Parquet ([`scan`], [`object_store`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -52,6 +54,7 @@ pub mod flight;
 pub mod flush;
 pub mod instance;
 pub mod memtable;
+pub mod object_store;
 pub mod parquet;
 pub mod partition;
 
@@ -70,8 +73,10 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/hetida.v1.rs"));
 }
 
+pub mod query;
 pub mod registry;
 pub mod retention;
+pub mod scan;
 pub mod schema;
 pub mod seq;
 pub mod stamp;

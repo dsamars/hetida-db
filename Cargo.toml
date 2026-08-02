@@ -25,6 +25,8 @@ arrow = "58.4"
 # The wire protocol (§5). Same Arrow version as above, by the rule in that
 # comment: it exchanges Arrow types across the crate boundary.
 arrow-flight = "58.4"
+# `ObjectStore` is an async trait, and this is the crate it is declared with.
+async-trait = "0.1"
 bytes = "1"
 # Calendar arithmetic for the Hive-style partition layout (§11). Pinned to the
 # version arrow already resolves, so only one chrono is in the graph.
@@ -38,6 +40,10 @@ datafusion = "54.1"
 # Stream combinators for the do_put/do_get streams; arrow-flight speaks in
 # `futures::Stream`, so this is its vocabulary rather than an extra choice.
 futures = "0.3"
+# DataFusion reads Parquet through this, so the archive's own `Storage` is
+# adapted onto it rather than the query path opening files behind its back —
+# one store, one truth. Pinned to the line datafusion 54.1 resolves.
+object_store = "0.13"
 # The archive format. Same Arrow version as above, by the rule in that comment:
 # it writes Arrow types straight to disk.
 parquet = { version = "58.4", features = ["zstd"] }

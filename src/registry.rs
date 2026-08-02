@@ -143,6 +143,41 @@ impl MetricRegistry {
         self.read().by_id.get(&id).cloned()
     }
 
+    /// Every registered series, in id order (§10).
+    ///
+    /// A full scan is the sanctioned operation here: the registry holds one row
+    /// per series, bounded by cardinality rather than ingest volume, and is
+    /// small enough to read whole. This is what the catalog tables are built
+    /// from and what a label predicate is resolved against.
+    pub fn all(&self) -> Vec<(MetricId, SeriesKey)> {
+        let state = self.read();
+        let mut series: Vec<(MetricId, SeriesKey)> = state
+            .by_id
+            .iter()
+            .map(|(id, key)| (*id, key.clone()))
+            .collect();
+        series.sort_by_key(|(id, _)| *id);
+        series
+    }
+
+    /// Ids of every series carrying `label` = `value`, ascending (§10).
+    ///
+    /// The direction §10 requires: a label predicate becomes a set of ids, which
+    /// then pushes down as a filter on `metric_id` and prunes row groups (§11).
+    /// An unknown label yields nothing, which as a filter is `false` — the right
+    /// answer, since no row can carry it.
+    pub fn matching(&self, label: &str, value: &str) -> Vec<MetricId> {
+        let state = self.read();
+        let mut ids: Vec<MetricId> = state
+            .by_id
+            .iter()
+            .filter(|(_, key)| key.labels().get(label).is_some_and(|held| held == value))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Number of registered series.
     pub fn len(&self) -> usize {
         self.read().by_series.len()
@@ -429,5 +464,50 @@ mod tests {
         ids.dedup();
 
         assert_eq!(ids.len(), THREADS);
+    }
+
+    /// §10: the catalog tables and the label pushdown both read the registry
+    /// whole, so the scan has to return every series exactly once, in id order.
+    #[test]
+    fn every_series_is_listed_once_in_id_order() {
+        let registry = registry().1;
+        let temp = registry.register(key("temp", &[("plant", "a")])).unwrap();
+        let flow = registry.register(key("flow", &[])).unwrap();
+        registry.register(key("temp", &[("plant", "a")])).unwrap();
+
+        let all = registry.all();
+
+        assert_eq!(all.len(), 2, "a re-registration must not add a row");
+        assert_eq!(all[0].0, temp.min(flow));
+        assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// §10: a label predicate resolves to a set of ids, which is what pushes
+    /// down as a filter on `metric_id`.
+    #[test]
+    fn a_label_resolves_to_the_ids_carrying_it() {
+        let registry = registry().1;
+        let a = registry.register(key("temp", &[("plant", "a")])).unwrap();
+        let b = registry.register(key("temp", &[("plant", "b")])).unwrap();
+        let both = registry
+            .register(key("flow", &[("plant", "a"), ("line", "1")]))
+            .unwrap();
+
+        let mut expected = vec![a, both];
+        expected.sort_unstable();
+        assert_eq!(registry.matching("plant", "a"), expected);
+        assert_eq!(registry.matching("plant", "b"), vec![b]);
+        assert_eq!(registry.matching("line", "1"), vec![both]);
+    }
+
+    /// An unknown label matches nothing, which as a filter is `false` — the
+    /// right answer, since no row can carry it.
+    #[test]
+    fn an_unknown_label_matches_nothing() {
+        let registry = registry().1;
+        registry.register(key("temp", &[("plant", "a")])).unwrap();
+
+        assert!(registry.matching("plant", "z").is_empty());
+        assert!(registry.matching("absent", "a").is_empty());
     }
 }
