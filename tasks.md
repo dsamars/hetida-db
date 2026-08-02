@@ -19,7 +19,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
 - [ ] Build the multi-table catalogue mapping table name to its `TableSchema`, applying evolution on ingest and surfacing rejections as explicit Flight errors (§6).
 - [x] Build the metric registry mapping name + label set to a `u64` id, idempotent on re-registration, durable before visible through a `RegistrationLog` seam (§10).
-- [ ] Wire the registry's `RegistrationLog` to the WAL and expose the registry as a queryable catalog table (§4, §10). *Blocked: registrations must outlive segment reclamation — see the open question.*
+- [ ] Back the registry's `RegistrationLog` with its own never-reclaimed log, replayed before the data log, and expose the registry as a queryable catalog table (§4, §10).
 - [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).
 - [x] Implement the system-column stamper appending `system_time` and `seq` on ingest, with `system_time` clamped so it never decreases as `seq` grows (§1).
 - [x] Implement lock-free concurrent versioned `MemTable`: `(metric_id, timestamp)` identifies a logical row, many versions coexist, nothing is overwritten (§1).

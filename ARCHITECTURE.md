@@ -77,8 +77,9 @@ The archive is **bitemporal**. Two independent time axes:
 ### 4. Write-Ahead Log
 
 - **Durability:** group commit. Concurrent writes share one fsync (max delay configurable, ~10ms). `do_put` acknowledges only after fsync, so *acked* means *durable*. Per-batch fsync would cost ~1ms per call and cap throughput far below the 1024-client target.
-- **Rotation:** one segment per N MB. A segment may be deleted once all data it covers is in Parquet, tracked by a checkpoint record.
-- **Recovery:** every record carries a CRC. Replay applies segments in sequence order. A torn tail record from a mid-write crash truncates the log at that point — it must never prevent startup.
+- **Two logs, one format.** The data log and the registration log (§10) share the record framing, the group commit and the recovery rule, and differ only in reclamation. `seq` is issued from one source across both, so the order between a registration and a write is always defined; the gaps this leaves in the data log's `seq` are harmless, because §1 requires monotonicity, not density.
+- **Rotation:** one segment per N MB. A data segment may be deleted once all data it covers is in Parquet, tracked by a checkpoint record. **Reclamation applies to the data log alone** — it is the only log whose contents reach Parquet. The registration log is never reclaimed (§10).
+- **Recovery:** every record carries a CRC. Replay applies segments in sequence order. A torn tail record from a mid-write crash truncates the log at that point — it must never prevent startup. The registration log is replayed first, so every id is resolvable before the data referring to it is.
 
 ### 5. Arrow Flight Surface
 
@@ -133,7 +134,12 @@ Retention has a **second, independent dimension** since §1:
 - **Resolution happens on the client, never on ingest.** Clients obtain ids once through a registration action, cache them, and send `u64` in `do_put`. Server-side name resolution would be a per-row lookup in the hot path.
 - **Registration is idempotent:** the same name and label set always yields the same id.
 - **Labels live in the registry only** and are not repeated in the data files. A label predicate resolves against the registry to a set of `metric_id`s first, which then pushes down as a filter on `metric_id`. The registry holds one row per series and is small enough to scan; the fact table stays narrow.
-- **The registry is critical state.** Without it the archive cannot be interpreted. It is written through the WAL like ingested data, belongs in every backup, and is exposed as a queryable catalog table.
+- **The registry is critical state.** Without it the archive cannot be interpreted, and it is the one piece of state that never reaches Parquet. It belongs in every backup — both logs do — and is exposed as a queryable catalog table.
+- **It lives in its own append-only log, which is never reclaimed.** Sharing the data log would place it under §4's reclamation rule, which drops a segment once its data is in Parquet — a condition registrations meet trivially and fatally. The point of a separate log is that the guarantee is *structural* rather than conditional: no code path exists that could delete a registration, so no misset flag and no write order interrupted by a crash can either. For the state the archive's readability depends on, that is the right kind of guarantee.
+  - *Rejected alternatives:* a **registry snapshot written before reclamation** puts critical state behind a multi-step non-atomic protocol, and wins no space — the snapshot holds precisely what the log already holds. **Reclamation skipping registration-bearing segments** lets one 80-byte record pin a whole segment of flushed data, making disk growth a function of registration cadence, which nothing bounds. **Flushing the registry to Parquet like a data table** still needs the log first, because durability precedes visibility while flush is asynchronous (§2), and the table fits neither the partition layout (§11) nor the sort order (§1).
+- **The log holds exactly one record per series and never needs compaction.** Idempotence is settled in memory before the log is touched, so a duplicate is never written and there is no garbage to collect. Its size is bounded by series cardinality rather than ingest volume, and a registry too large for the disk was already too large for the memory it is held in.
+- **A torn tail record is correctly lost.** An id is returned only once its append is durable, so a record a crash damaged is by construction an id no client ever saw. Discarding it and handing the id to another series is sound; numbering resumes past the highest surviving id.
+- **Retention never removes a registration.** Dropping a series' last partition (§8) leaves its identity in place, so re-registering it later still yields the same id.
 
 ### 11. Partition Layout
 
@@ -161,6 +167,5 @@ Retention has a **second, independent dimension** since §1:
 - **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
 - **Downsampling / rollup** before retention deletion (§8) — deferred.
 - **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.
-- **Where registrations live** (§4 vs §10) — §10 puts the registry through the WAL, but §4 reclaims a segment once its data is in Parquet. Registrations are not flushed to Parquet, so reclaiming a segment holding them destroys the registry and with it the archive's interpretability. Resolutions: a separate never-reclaimed log, a registry snapshot written before reclamation, or reclamation skipping segments that hold registrations (which leaks segments). Undecided; the WAL wiring is blocked on it.
 - **How far back retransmission suppression must reach** (§1) — it currently compares against the newest version the *active* memtable holds, so a retry arriving after that version was flushed is not recognised and becomes a phantom version. Closing the gap means either carrying a payload digest per logical row across freezes, or consulting flushed data on ingest. Undecided.
 - **Tiered partition intervals** (§11) — fine granularity for recent data, coarse for aged. Not needed for the stated weeks-to-months query pattern, which a flat configurable interval already serves; deferred unless measurement contradicts it.
