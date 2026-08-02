@@ -40,11 +40,27 @@ Full reference: [`CONFIGURATION.md`](CONFIGURATION.md).
 | `HETIDA_ALLOW_PLAINTEXT` | — | `1` to serve without TLS, deliberately |
 | `HETIDA_USERS` | — | `name:password:read=a,b:write=c`, `;`-separated |
 | `HETIDA_ALLOW_ANONYMOUS` | — | `1` to serve without authentication, deliberately |
+| `HETIDA_CONFIG` | — | Path to the configuration file; unset means the defaults |
+
+The environment says where the archive is deployed and how it is secured; the file says how it behaves. Nothing is settable in both.
+
+```toml
+# hetida.toml — every key optional, shown here at a non-default setting
+partition_interval = "day"
+max_memtable_bytes = "2GiB"
+
+[flush]
+max_age = "2m"
+
+[tables.forecast]
+suppression_window = "1h"   # a job recomputing its horizon hourly (§1)
+retention = "400d"          # dropped by whole partitions, by event time (§8)
+```
 
 Two things are worth knowing before the first start:
 
 - **The partition interval is immutable once data exists.** It defaults to `month`, is recorded in `instance.meta` at initialisation, and a later start that disagrees is a startup error rather than a silent second layout. It also bounds retention, since whole partitions are dropped — choose the two together.
-- **Everything else takes a compiled default.** Flush and compaction thresholds, the memory cap, suppression reach and per-table retention are settled in code; only the variables above are reachable from the binary today. `CONFIGURATION.md` documents each default, what it costs, and how to change it by embedding the crate.
+- **A named configuration file that cannot be read stops the start, and unknown keys are rejected.** A file is written by hand, and a misspelled `retention` that is silently ignored is the costliest failure there is to find.
 
 ## Using it
 

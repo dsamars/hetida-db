@@ -651,3 +651,111 @@ fn expired_partitions_are_dropped_and_their_range_is_then_refused() {
         .ingest("readings", &client_batch(&[(1, AUGUST, 3.5)]))
         .expect("a retained partition must stay writable");
 }
+
+/// §6, §8: the chain the configuration file exists to close. A retention
+/// horizon written in TOML has to reach the catalogue, then the reaper, then the
+/// refusal on ingest — and until the file existed there was no way to set one
+/// without embedding the crate.
+#[test]
+fn a_retention_horizon_from_a_file_reaches_the_reaper_and_the_refusal() {
+    use hetida_db::archive::IngestError;
+    use hetida_db::compact::partition_dirs;
+    use hetida_db::config::FileConfig;
+    use hetida_db::flush::Flusher;
+    use hetida_db::parquet::ParquetConfig;
+    use hetida_db::retention::Reaper;
+
+    let file = FileConfig::parse(
+        r#"
+        [tables.readings]
+        retention = "30d"
+        "#,
+    )
+    .expect("configuration");
+
+    let storage = InMemoryStorage::new();
+    let clock = Arc::new(TestClock::new(JUNE));
+    let archive = Archive::open(
+        Arc::new(storage.clone()),
+        &ArchiveConfig {
+            wal: wal_config(),
+            ..file.archive()
+        },
+        Arc::clone(&clock) as Arc<_>,
+    )
+    .expect("archive");
+
+    // June is live in June, so the write is accepted and reaches Parquet.
+    archive
+        .ingest("readings", &client_batch(&[(1, JUNE, 1.5)]))
+        .expect("june is live");
+    let state = archive.table("readings").expect("readings");
+    let flusher = Flusher::new(
+        Arc::new(storage.clone()),
+        "readings",
+        archive.interval(),
+        ParquetConfig::default(),
+    );
+    for start in state.partition_starts() {
+        flusher.flush(&state, start).expect("flush");
+    }
+    assert_eq!(
+        partition_dirs(&storage, "readings", archive.interval())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The horizon the file named must be the one the catalogue reports…
+    let retention = archive.catalogue().config("readings").retention;
+    assert_eq!(retention, Some(30 * DAY), "the file's horizon must arrive");
+
+    // …the one the reaper acts on…
+    clock.set(AUGUST);
+    let pass = Reaper::new(Arc::new(storage.clone()), archive.interval())
+        .reap("readings", retention, clock.now_micros())
+        .expect("reap");
+    assert_eq!(pass.dropped.len(), 1, "june has cleared a 30-day horizon");
+
+    // …and the one that refuses a write back into the dropped range (§8).
+    let error = archive
+        .ingest("readings", &client_batch(&[(1, JUNE, 1.5)]))
+        .expect_err("june is past the cutoff now");
+    assert!(matches!(error, IngestError::Expired { .. }), "{error}");
+}
+
+/// A table the file says nothing about keeps everything — the file must not
+/// turn retention on for anyone who did not ask for it (§8).
+#[test]
+fn a_file_that_configures_one_table_does_not_give_another_a_horizon() {
+    use hetida_db::config::FileConfig;
+
+    let file = FileConfig::parse(
+        r#"
+        [tables.readings]
+        retention = "30d"
+        "#,
+    )
+    .expect("configuration");
+
+    let storage = InMemoryStorage::new();
+    let archive = Archive::open(
+        Arc::new(storage.clone()),
+        &ArchiveConfig {
+            wal: wal_config(),
+            ..file.archive()
+        },
+        Arc::new(TestClock::new(AUGUST)),
+    )
+    .expect("archive");
+
+    assert_eq!(
+        archive.catalogue().config("readings").retention,
+        Some(30 * DAY)
+    );
+    assert_eq!(
+        archive.catalogue().config("audit").retention,
+        None,
+        "an unnamed table must keep everything"
+    );
+}

@@ -12,17 +12,23 @@ Settings fall into three groups, and the difference matters:
 | Group | Set by | Changeable |
 |---|---|---|
 | [Environment variables](#environment-variables) | the operator, at launch | every start |
+| [The configuration file](#the-configuration-file) | `HETIDA_CONFIG` | every start |
 | [Instance metadata](#instance-metadata) | recorded at initialisation | never, once data exists |
-| [Compiled defaults](#compiled-defaults) | the code | only by embedding the crate — see [the gap](#what-an-operator-cannot-set-yet) |
+
+The split between the first two is deliberate: **the environment says where the
+archive is deployed and how it is secured, the file says how it behaves.**
+Nothing is settable in both, so there is never a question of which one won.
 
 ## Environment variables
 
-The whole operator surface of the `hetida-db` binary today.
+Deployment and security. Everything about the archive's behaviour is in
+[the file](#the-configuration-file).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `HETIDA_DATA_DIR` | `hetida-data` | Root of the archive: logs, Parquet and instance metadata |
 | `HETIDA_LISTEN` | `127.0.0.1:50051` | Socket address to serve Arrow Flight on |
+| `HETIDA_CONFIG` | — | Path to the configuration file; unset means the defaults |
 | `HETIDA_TLS_CERT` | — | Path to a PEM certificate chain (§9) |
 | `HETIDA_TLS_KEY` | — | Path to the matching PEM private key (§9) |
 | `HETIDA_ALLOW_PLAINTEXT` | — | `1` to serve without TLS, deliberately |
@@ -123,6 +129,11 @@ What a grant covers:
 - `get_schema` and `get_flight_info` need the same read grant the rows do, or a
   schema would describe a table to a client that may not see inside it.
 
+Credentials live in the environment rather than in the configuration file, which
+is a deliberate split but not an ideal one: an environment variable is visible in
+`ps` and in a process's `/proc` entry. Moving them into the file — or behind one
+of the backends below — is the obvious next step.
+
 Credentials are checked through a `CredentialStore` trait; the static
 configuration above is the v1 backend. OIDC/JWT and mTLS client certificates are
 later backends, which is why authentication answers with a principal rather than
@@ -134,10 +145,157 @@ Tokens are 32 random bytes from the operating system, hex encoded, valid for
 is correct — the archive's durable state is its data, not its sessions, and a
 client already has to handle re-handshaking.
 
+## The configuration file
+
+`HETIDA_CONFIG` names a TOML file describing how the archive behaves. Unset means
+the defaults below, which are safe. A file that *is* named but cannot be read,
+parsed or understood **stops the start** — an operator who wrote a configuration
+meant it to take effect, and starting with defaults instead would be the silent
+kind of wrong.
+
+**Unknown keys are rejected.** This file is written by hand, and a misspelled
+`retention` that is quietly ignored is the costliest failure there is to find.
+(Instance metadata takes the opposite rule, for the opposite reason — it is
+machine-written, and tolerating unknown keys is what lets an older build read a
+newer one's file.)
+
+### Units
+
+Durations carry a suffix; sizes may. A bare number is bytes for a size and an
+**error** for a duration: there is no defensible default unit for time here, and
+reading `5` as seconds where an operator meant milliseconds changes what the
+setting means rather than how large it is.
+
+| | Accepted |
+|---|---|
+| Duration | `ms`, `s`, `m`, `h`, `d` — `"10ms"`, `"5m"`, `"90d"` |
+| Size | `B`, `KiB`, `MiB`, `GiB`, and the 1000-based `KB`, `MB`, `GB`; or a bare number of bytes |
+
+Case does not matter and a space before the unit is fine, so `"512 MiB"` and
+`"512mib"` both work.
+
+### A complete file, at its defaults
+
+Every key is optional. This is what the archive does if the file is absent.
+
+```toml
+# Layout granularity, validated against instance.meta (§11). Immutable once
+# data exists — see below.
+partition_interval = "month"
+
+# Past this, do_put answers RESOURCE_EXHAUSTED rather than buffering without
+# bound (§7). Counts frozen memtables too, so a stalled flush makes the cap
+# bite instead of looking free.
+max_memtable_bytes = "1GiB"
+
+[wal]
+# Rotation point. Smaller segments reclaim sooner and cost more files.
+segment_bytes = "64MiB"
+# How long the writer waits for stragglers before syncing (§4). An
+# acknowledgement waits for its fsync, so this is added to every do_put: it
+# buys throughput with latency and nothing else. "0ms" groups only what is
+# already queued.
+max_commit_delay = "10ms"
+
+[flush]
+# Per-partition size trigger. Large enough for row groups worth pruning, small
+# enough that several partitions stay inside a memory budget.
+max_bytes = "64MiB"
+# Per-partition age trigger, measured against the clock. Whichever fires first
+# (§2). Age is what bounds the staleness of a low-rate metric, which the size
+# cap alone never would.
+max_age = "5m"
+# How often the flusher looks. Far below max_age, so a partition is flushed
+# close to when it becomes due rather than a whole tick late.
+tick = "10s"
+
+[compaction]
+# Compact once a partition holds this many files. Beyond four, footer reads
+# start to dominate (§11).
+max_files = 4
+# Or once the partition totals this much.
+max_bytes = "256MiB"
+# Soft target per output file: a file is cut at the next key boundary past it,
+# so output ranges stay disjoint (§3).
+target_bytes = "128MiB"
+# Compaction rewrites a whole partition where a flush appends one file, so it
+# runs far less often.
+tick = "5m"
+
+[parquet]
+# ZSTD's own default: most of the ratio for little of the cost.
+zstd_level = 3
+# The unit of skipping. Smaller groups prune more finely and cost more
+# metadata (§11).
+row_group_rows = 131072
+
+[retention]
+# How often the reaper looks. Comfortably below the finest partition interval,
+# which is an hour.
+tick = "15m"
+
+# Applies to any table [tables.*] does not name.
+[table_defaults]
+# Ingest-time span over which a byte-identical resend is recognised as a
+# retransmission rather than recorded as a new version (§1).
+suppression_window = "5m"
+# Entries one generation holds before the window is cut short — roughly 200 MB
+# across both generations.
+suppression_max_entries = 2000000
+# retention is unset: keep forever. Retention deletes, so it is never inferred.
+```
+
+### Per-table settings
+
+A `[tables.<name>]` section starts from `[table_defaults]` and overrides only
+what it names, so setting one field never silently clears the rest.
+
+```toml
+[table_defaults]
+suppression_window = "5m"
+
+# A job recomputing its horizon every hour resubmits values that mostly have
+# not changed. The reach has to span the gap between two runs, or every run
+# manufactures a version (§1, §6).
+[tables.forecast]
+suppression_window = "1h"
+retention = "400d"
+
+# A measurement stream: keys never recur, so the default minutes are right and
+# a longer window would only cost memory.
+[tables.readings]
+retention = "90d"
+
+# Named nowhere, so: default suppression, and kept forever.
+# [tables.audit]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `suppression_window` | `"5m"` | Reach of unchanged-value suppression (§1) |
+| `suppression_max_entries` | 2 000 000 | Entries before the window is cut short |
+| `retention` | unset — keep forever | Event-time horizon (§8) |
+
+Two things about retention are easy to get wrong:
+
+- **Resolution can never be finer than the partition interval,** because whole
+  partitions are dropped. With `month` partitions and `"90d"`, data survives
+  until its whole month clears the cutoff — up to roughly 120 days (§8). Choose
+  the two together.
+- **Version retention is a separate, unbounded dimension.** Every correction is
+  kept and time travel reaches back to the first write (§1, §8). `retention`
+  drops whole partitions by event time; it does not thin the history inside the
+  ones that survive.
+
+Ingesting into a partition the reaper could already drop is refused with
+`FAILED_PRECONDITION`. A row behind the horizon that shares a partition with
+live data is still accepted, because that partition is kept and served.
+
 ## Instance metadata
 
 `instance.meta` records what an instance was initialised with. It is written once,
-on the first start against an empty directory, and validated at every later start.
+on the first start against an empty directory, and validated at every later start
+against `partition_interval` in [the configuration file](#the-configuration-file).
 
 | Key | Values | Default |
 |---|---|---|
@@ -172,138 +330,6 @@ that pattern (§11).
 The interval also bounds retention: whole partitions are dropped, so **retention
 resolution can never be finer than the partition interval** (§8). Choose the two
 together.
-
-## Compiled defaults
-
-These are settled in code and are not reachable from the binary today — see
-[the gap](#what-an-operator-cannot-set-yet). They are documented because they
-describe what the server actually does, and because embedding the crate is a
-supported way to change them.
-
-### Archive (`ArchiveConfig`, `src/archive.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `partition_interval` | `month` | Validated against `instance.meta` — see above |
-| `max_memtable_bytes` | 1 GiB | Past this, `do_put` answers `RESOURCE_EXHAUSTED` rather than buffering without bound (§7). Large enough that a healthy instance never meets it, small enough that an overloaded one refuses before the host does |
-| `default_table` | see below | Applies to any table no entry names |
-| `tables` | none | Per-table overrides (§6) |
-
-The cap counts frozen memtables as well as active ones, because a frozen table
-still occupies memory until its Parquet file exists. A stalled flush is exactly
-when the cap must bite.
-
-### Per table (`TableConfig`, `src/catalog.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `suppression.window` | 5 min | Ingest-time span over which a byte-identical resend is recognised as a retransmission rather than recorded as a new version (§1) |
-| `suppression.max_entries` | 2 000 000 | Entries one generation holds before the window is cut short — roughly 200 MB across both generations |
-| `retention` | none — keep forever | Event-time horizon (§8) |
-
-Two presets, and the choice is about the producer's rhythm rather than the
-transport (§1, §6):
-
-- `SuppressionConfig::for_stream()` — the default. Five minutes, covering transport
-  retries only. A stream's keys never recur, so every entry is dead weight once its
-  retry window has passed.
-- `SuppressionConfig::for_recomputed(interval)` — for a table a scheduled job
-  rewrites. A job recomputing its horizon hourly resubmits values that mostly have
-  not changed, and the reach has to span the gap between two runs or **every run
-  manufactures a version**. Pass the run interval generously: a run that slips past
-  the window is simply not recognised. Memory does not grow with ingest here, since
-  the same keys recur every run.
-
-Retention is unset by default, and an unconfigured table is never even examined by
-the reaper. An archive nobody gave a horizon cannot lose anything. When it is set:
-
-- A partition is dropped only once its **entire interval** is past the cutoff, so
-  coarse intervals over-retain — with `month` partitions and a 90-day policy, data
-  survives up to roughly 120 days (§8).
-- Ingesting into a partition the reaper could already drop is refused with
-  `FAILED_PRECONDITION`. A row behind the horizon that shares a partition with live
-  data is still accepted, because that partition is kept and served.
-- Version retention is a separate, unbounded dimension: every correction is kept
-  and time travel reaches back to the first write (§1, §8).
-
-### Write-ahead log (`WalConfig`, `src/wal.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `segment_bytes` | 64 MiB | Rotation point. Smaller segments reclaim sooner and cost more files |
-| `max_commit_delay` | 10 ms | How long the writer waits for stragglers before syncing. Larger amortises the fsync across more writers at the cost of acknowledgement latency; zero groups only what is already queued (§4) |
-
-An acknowledgement means the rows survive a crash, so this delay is added to every
-`do_put` acknowledgement — it buys throughput with latency, and nothing else.
-
-### Flush (`FlushConfig`, `src/flush.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `max_bytes` | 64 MiB | Per-partition size trigger. Large enough for row groups worth pruning, small enough that several partitions stay inside a memory budget |
-| `max_age` | 5 min | Per-partition age trigger, measured against the clock |
-
-Whichever fires first (§2). Age is what bounds the data-loss window and the query
-staleness of a low-rate metric — one written once an hour would otherwise sit in
-memory indefinitely. It is measured against the clock rather than ingest time, so
-a quiescent instance still sheds its state.
-
-### Compaction (`CompactConfig`, `src/compact.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `max_files` | 4 | Compact once a partition holds this many files. Beyond four, footer reads start to dominate (§11) |
-| `max_bytes` | 256 MiB | Compact once the partition totals this much |
-| `target_bytes` | 128 MiB | Soft target per output file — a file is cut at the next key boundary past it, so output ranges stay disjoint (§3) |
-
-A single file is never compacted: merging one file into one file changes nothing
-and would rewrite the partition on every pass.
-
-### Parquet (`ParquetConfig`, `src/parquet.rs`)
-
-| Setting | Default | What it costs |
-|---|---|---|
-| `zstd_level` | 3 | ZSTD's own default: most of the ratio for little of the cost |
-| `row_group_rows` | 131 072 | The unit of skipping. Smaller groups prune more finely and cost more metadata |
-
-Page-level statistics are written on every column, `system_time` included, so an
-old observation point skips rows written after it (§1).
-
-### Background timers (`src/main.rs`)
-
-| Timer | Interval | Why |
-|---|---|---|
-| Flush | 10 s | Far below the age bound it enforces, so a partition is flushed close to when it becomes due |
-| Compaction | 5 min | Compaction rewrites a whole partition where a flush appends one file; sharing the flush tick would compact far more often than needed |
-| Retention | 15 min | Comfortably below the finest partition interval, which is an hour |
-
-## What an operator cannot set yet
-
-The binary reads the seven environment variables above and takes **compiled
-defaults for everything else**. Retention in particular is implemented, tested and
-documented, but `ArchiveConfig::tables` is empty in `main.rs`, so there is no way
-to give a table a horizon without embedding the crate:
-
-```rust
-use hetida_db::archive::ArchiveConfig;
-use hetida_db::catalog::TableConfig;
-
-const DAY: i64 = 86_400_000_000;
-
-let config = ArchiveConfig {
-    tables: vec![(
-        "readings".to_owned(),
-        TableConfig {
-            retention: Some(90 * DAY),
-            ..TableConfig::default()
-        },
-    )],
-    ..ArchiveConfig::default()
-};
-```
-
-A configuration file covering the compiled defaults is not yet written. Until it
-is, treat this section as the specification of what such a file would carry.
 
 ## Query surface
 

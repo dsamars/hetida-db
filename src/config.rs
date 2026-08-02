@@ -1,0 +1,771 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Heiko Dietz
+
+//! The archive configuration file.
+//!
+//! Everything about *how the archive behaves* — the partition interval, the
+//! memory cap, the write-ahead log, flush and compaction thresholds, Parquet
+//! settings, and per-table suppression and retention. Deployment and security
+//! stay in the environment ([`crate::serve`]): where the data lives, what to
+//! listen on, TLS, credentials.
+//!
+//! The split is deliberate and it removes precedence rules entirely. Nothing is
+//! settable in two places, so there is never a question of which one won.
+//!
+//! # A missing file is defaults; a broken one is a refusal
+//!
+//! No file means the compiled defaults, which are safe. A file that was named
+//! but cannot be read, parsed or understood stops the start — an operator who
+//! wrote a configuration meant it to take effect, and starting with defaults
+//! instead would be the silent kind of wrong.
+//!
+//! Unknown keys are **rejected** for the same reason. This file is written by
+//! hand, and a misspelled `retention` that is quietly ignored is the failure
+//! mode that costs the most to find. (Instance metadata takes the opposite rule
+//! — it is machine-written, and tolerating unknown keys is what lets an older
+//! build read a newer one's file.)
+//!
+//! # Units are in the value, never assumed
+//!
+//! Durations carry a suffix (`ms`, `s`, `m`, `h`, `d`) and sizes may (`KiB`,
+//! `MiB`, `GiB`, or the 1000-based `KB`, `MB`, `GB`). A bare number is bytes for
+//! a size and an error for a duration: there is no defensible default unit for
+//! time here, and guessing seconds where an operator meant milliseconds changes
+//! the meaning of the setting rather than its magnitude.
+//!
+//! ```toml
+//! partition_interval = "month"
+//! max_memtable_bytes = "1GiB"
+//!
+//! [flush]
+//! max_bytes = "64MiB"
+//! max_age = "5m"
+//!
+//! [table_defaults]
+//! suppression_window = "5m"
+//!
+//! [tables.forecast]
+//! suppression_window = "1h"   # a job recomputing its horizon hourly (§1)
+//! retention = "400d"
+//! ```
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::archive::ArchiveConfig;
+use crate::catalog::TableConfig;
+use crate::clock::Micros;
+use crate::compact::CompactConfig;
+use crate::flush::FlushConfig;
+use crate::parquet::ParquetConfig;
+use crate::partition::PartitionInterval;
+use crate::suppression::SuppressionConfig;
+use crate::wal::WalConfig;
+
+/// Path to the configuration file, if one is used.
+pub const CONFIG_VAR: &str = "HETIDA_CONFIG";
+
+/// Why a configuration file could not be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigFileError {
+    /// The file could not be read.
+    #[error("could not read `{path}`: {source}")]
+    Unreadable {
+        /// The path that was named.
+        path: String,
+        /// What the operating system said.
+        source: std::io::Error,
+    },
+    /// The file is not valid configuration.
+    ///
+    /// Carries the message as `toml` rendered it, which names the line and the
+    /// key — an operator needs to know *where*, not only that something is wrong.
+    #[error("`{path}` is not valid configuration:\n{reason}")]
+    Invalid {
+        /// The path that was named.
+        path: String,
+        /// The parser's account of the problem.
+        reason: String,
+    },
+}
+
+/// How often the background tasks look for work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticks {
+    /// Flush interval (§2).
+    pub flush: Duration,
+    /// Compaction interval (§3).
+    pub compaction: Duration,
+    /// Retention interval (§8).
+    pub retention: Duration,
+}
+
+impl Default for Ticks {
+    fn default() -> Self {
+        Self {
+            // Far below the age bound the flusher enforces, so a partition is
+            // flushed close to when it becomes due rather than a whole tick late.
+            flush: Duration::from_secs(10),
+            // Compaction rewrites a whole partition where a flush appends one
+            // file; sharing the flush tick would compact far more than needed.
+            compaction: Duration::from_secs(300),
+            // Comfortably below the finest partition interval, which is an hour.
+            retention: Duration::from_secs(900),
+        }
+    }
+}
+
+/// The archive configuration, as a file describes it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FileConfig {
+    /// Layout granularity, validated against the instance metadata (§11).
+    partition_interval: Option<Interval>,
+    /// Hard cap on memtable bytes before ingestion is refused (§7).
+    max_memtable_bytes: Option<Size>,
+    #[serde(rename = "wal")]
+    log: WalSection,
+    flush: FlushSection,
+    compaction: CompactionSection,
+    parquet: ParquetSection,
+    retention: RetentionSection,
+    /// Applies to any table `tables` does not name.
+    table_defaults: TableSection,
+    /// Per-table overrides (§6).
+    tables: BTreeMap<String, TableSection>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct WalSection {
+    segment_bytes: Option<Size>,
+    max_commit_delay: Option<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct FlushSection {
+    max_bytes: Option<Size>,
+    max_age: Option<Span>,
+    tick: Option<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct CompactionSection {
+    max_files: Option<usize>,
+    max_bytes: Option<Size>,
+    target_bytes: Option<Size>,
+    tick: Option<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ParquetSection {
+    zstd_level: Option<i32>,
+    row_group_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RetentionSection {
+    tick: Option<Span>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct TableSection {
+    suppression_window: Option<Span>,
+    suppression_max_entries: Option<usize>,
+    /// Unset keeps forever (§8). Retention deletes, so it is never inferred.
+    retention: Option<Span>,
+}
+
+impl FileConfig {
+    /// Reads the configuration at `path`.
+    pub fn load(path: &Path) -> Result<Self, ConfigFileError> {
+        let shown = path.display().to_string();
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Unreadable {
+            path: shown.clone(),
+            source,
+        })?;
+        Self::parse(&text).map_err(|reason| ConfigFileError::Invalid {
+            path: shown,
+            reason,
+        })
+    }
+
+    /// Reads the configuration from TOML text.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        toml::from_str(text).map_err(|error| error.to_string())
+    }
+
+    /// Reads the file `CONFIG_VAR` names, or the defaults if it names none.
+    ///
+    /// `lookup` is the environment, injected so this is testable without one.
+    pub fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigFileError> {
+        match lookup(CONFIG_VAR).filter(|path| !path.trim().is_empty()) {
+            Some(path) => Self::load(Path::new(&path)),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// The archive settings, with the per-table configuration folded in.
+    pub fn archive(&self) -> ArchiveConfig {
+        let defaults = ArchiveConfig::default();
+        ArchiveConfig {
+            partition_interval: self
+                .partition_interval
+                .map_or(defaults.partition_interval, |interval| interval.0),
+            wal: WalConfig {
+                segment_bytes: self
+                    .log
+                    .segment_bytes
+                    .map_or(defaults.wal.segment_bytes, |size| size.0),
+                max_commit_delay: self
+                    .log
+                    .max_commit_delay
+                    .map_or(defaults.wal.max_commit_delay, Span::duration),
+            },
+            default_table: self.table_defaults.resolve(&TableConfig::default()),
+            tables: self
+                .tables
+                .iter()
+                .map(|(name, section)| {
+                    // A named table starts from the instance defaults, so an
+                    // override sets one field without silently clearing the rest.
+                    let base = self.table_defaults.resolve(&TableConfig::default());
+                    (name.clone(), section.resolve(&base))
+                })
+                .collect(),
+            max_memtable_bytes: self
+                .max_memtable_bytes
+                .map_or(defaults.max_memtable_bytes, |size| {
+                    usize::try_from(size.0).unwrap_or(usize::MAX)
+                }),
+        }
+    }
+
+    /// When a partition is flushed (§2).
+    pub fn flush(&self) -> FlushConfig {
+        let defaults = FlushConfig::default();
+        FlushConfig {
+            max_bytes: self.flush.max_bytes.map_or(defaults.max_bytes, |size| {
+                usize::try_from(size.0).unwrap_or(usize::MAX)
+            }),
+            max_age: self.flush.max_age.map_or(defaults.max_age, |span| span.0),
+        }
+    }
+
+    /// When a partition is compacted (§3).
+    pub fn compaction(&self) -> CompactConfig {
+        let defaults = CompactConfig::default();
+        CompactConfig {
+            max_files: self.compaction.max_files.unwrap_or(defaults.max_files),
+            max_bytes: self
+                .compaction
+                .max_bytes
+                .map_or(defaults.max_bytes, Size::usize),
+            target_bytes: self
+                .compaction
+                .target_bytes
+                .map_or(defaults.target_bytes, Size::usize),
+        }
+    }
+
+    /// How a partition file is written (§1).
+    pub fn parquet(&self) -> ParquetConfig {
+        let defaults = ParquetConfig::default();
+        ParquetConfig {
+            zstd_level: self.parquet.zstd_level.unwrap_or(defaults.zstd_level),
+            row_group_rows: self
+                .parquet
+                .row_group_rows
+                .unwrap_or(defaults.row_group_rows),
+        }
+    }
+
+    /// How often each background task looks for work.
+    pub fn ticks(&self) -> Ticks {
+        let defaults = Ticks::default();
+        Ticks {
+            flush: self.flush.tick.map_or(defaults.flush, Span::duration),
+            compaction: self
+                .compaction
+                .tick
+                .map_or(defaults.compaction, Span::duration),
+            retention: self
+                .retention
+                .tick
+                .map_or(defaults.retention, Span::duration),
+        }
+    }
+}
+
+impl TableSection {
+    /// This section applied over `base`, leaving unset fields as they were.
+    fn resolve(&self, base: &TableConfig) -> TableConfig {
+        TableConfig {
+            suppression: SuppressionConfig {
+                window: self
+                    .suppression_window
+                    .map_or(base.suppression.window, |span| span.0),
+                max_entries: self
+                    .suppression_max_entries
+                    .unwrap_or(base.suppression.max_entries),
+            },
+            // Unset means "keep forever", and a table section that says nothing
+            // about retention inherits rather than clears (§8).
+            retention: self.retention.map(|span| span.0).or(base.retention),
+        }
+    }
+}
+
+// ---- units ----
+
+/// A partition interval, spelled as in the instance metadata (§11).
+#[derive(Debug, Clone, Copy)]
+struct Interval(PartitionInterval);
+
+impl<'de> Deserialize<'de> for Interval {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        PartitionInterval::from_str(&text)
+            .map(Interval)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A span of time, in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Span(Micros);
+
+impl Span {
+    fn duration(self) -> Duration {
+        Duration::from_micros(u64::try_from(self.0).unwrap_or(0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Span {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse_span(&text)
+            .map(Span)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A number of bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Size(u64);
+
+impl Size {
+    fn usize(self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+}
+
+impl<'de> Deserialize<'de> for Size {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// A size is written either as a plain number of bytes or with a unit.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Bytes(u64),
+            Text(String),
+        }
+
+        match Written::deserialize(deserializer)? {
+            Written::Bytes(bytes) => Ok(Size(bytes)),
+            Written::Text(text) => parse_size(&text)
+                .map(Size)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Reads `10ms`, `30s`, `5m`, `12h`, `90d` as microseconds.
+///
+/// A bare number is refused. There is no defensible default unit here: reading
+/// `5` as seconds where an operator meant milliseconds changes what the setting
+/// means, not merely how large it is.
+fn parse_span(text: &str) -> Result<Micros, String> {
+    const UNITS: [(&str, Micros); 5] = [
+        ("ms", 1_000),
+        ("s", 1_000_000),
+        ("m", 60_000_000),
+        ("h", 3_600_000_000),
+        ("d", 86_400_000_000),
+    ];
+    parse_with_unit(text, &UNITS, "a duration needs a unit: ms, s, m, h or d")
+}
+
+/// Reads `4096`, `64KiB`, `256MiB`, `1GiB` — or the 1000-based `KB`, `MB`, `GB`
+/// — as bytes.
+fn parse_size(text: &str) -> Result<u64, String> {
+    const UNITS: [(&str, i64); 7] = [
+        ("kib", 1024),
+        ("mib", 1024 * 1024),
+        ("gib", 1024 * 1024 * 1024),
+        ("kb", 1_000),
+        ("mb", 1_000_000),
+        ("gb", 1_000_000_000),
+        ("b", 1),
+    ];
+    let bytes = parse_with_unit(
+        text,
+        &UNITS,
+        "a size needs a unit: B, KiB, MiB, GiB, or the 1000-based KB, MB, GB",
+    )?;
+    u64::try_from(bytes).map_err(|_| format!("`{text}` is not a number of bytes"))
+}
+
+/// Splits `text` into a number and one of `units`, longest suffix first.
+///
+/// Case-insensitive, and tolerant of a space before the unit. Longest first
+/// matters: `ms` must not be read as `m` followed by rubbish, and `mib` must not
+/// be read as `mb`.
+fn parse_with_unit(text: &str, units: &[(&str, i64)], missing: &str) -> Result<i64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("an empty value".to_owned());
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+
+    let mut candidates: Vec<&(&str, i64)> = units.iter().collect();
+    candidates.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+
+    for (suffix, scale) in candidates {
+        let Some(number) = lowered.strip_suffix(suffix) else {
+            continue;
+        };
+        let number = number.trim();
+        let amount: i64 = number
+            .parse()
+            .map_err(|_| format!("`{number}` in `{trimmed}` is not a whole number"))?;
+        if amount < 0 {
+            return Err(format!("`{trimmed}` is negative"));
+        }
+        return amount
+            .checked_mul(*scale)
+            .ok_or_else(|| format!("`{trimmed}` does not fit"));
+    }
+
+    // A bare number is a size in bytes, and never a duration.
+    if let Ok(bare) = lowered.parse::<i64>()
+        && units.iter().any(|(suffix, _)| *suffix == "b")
+    {
+        return Ok(bare);
+    }
+    Err(format!("`{trimmed}`: {missing}"))
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unreachable
+)]
+mod tests {
+    use super::*;
+
+    const MINUTE: Micros = 60_000_000;
+    const HOUR: Micros = 3_600_000_000;
+    const DAY: Micros = 86_400_000_000;
+
+    fn parsed(text: &str) -> FileConfig {
+        FileConfig::parse(text).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    // ---- units ----
+
+    #[test]
+    fn a_duration_reads_every_unit() {
+        assert_eq!(parse_span("10ms"), Ok(10_000));
+        assert_eq!(parse_span("30s"), Ok(30_000_000));
+        assert_eq!(parse_span("5m"), Ok(5 * MINUTE));
+        assert_eq!(parse_span("12h"), Ok(12 * HOUR));
+        assert_eq!(parse_span("90d"), Ok(90 * DAY));
+    }
+
+    /// `ms` must not be read as `m` with rubbish after it — the two differ by a
+    /// factor of sixty thousand.
+    #[test]
+    fn the_longest_unit_wins() {
+        assert_eq!(parse_span("5ms"), Ok(5_000));
+        assert_eq!(parse_span("5m"), Ok(5 * MINUTE));
+        assert_eq!(parse_size("5mib"), Ok(5 * 1024 * 1024));
+        assert_eq!(parse_size("5mb"), Ok(5_000_000));
+    }
+
+    /// There is no defensible default unit for time: reading `5` as seconds
+    /// where an operator meant milliseconds changes what the setting means.
+    #[test]
+    fn a_duration_without_a_unit_is_refused() {
+        assert!(parse_span("5").is_err());
+        assert!(parse_span("").is_err());
+        assert!(parse_span("soon").is_err());
+        assert!(parse_span("-5m").is_err());
+    }
+
+    #[test]
+    fn a_size_reads_binary_and_decimal_units() {
+        assert_eq!(parse_size("4096"), Ok(4096), "a bare number is bytes");
+        assert_eq!(parse_size("64KiB"), Ok(65_536));
+        assert_eq!(parse_size("1GiB"), Ok(1_073_741_824));
+        assert_eq!(parse_size("1GB"), Ok(1_000_000_000));
+        assert_eq!(parse_size("512 MiB"), Ok(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_size_that_makes_no_sense_is_refused() {
+        assert!(parse_size("plenty").is_err());
+        assert!(parse_size("-1MiB").is_err());
+        assert!(parse_size("9999999999GiB").is_err(), "must not wrap");
+    }
+
+    // ---- the file ----
+
+    /// No file at all is the compiled defaults, which are safe.
+    #[test]
+    fn an_empty_file_is_the_compiled_defaults() {
+        let config = parsed("");
+        let defaults = ArchiveConfig::default();
+
+        assert_eq!(
+            config.archive().max_memtable_bytes,
+            defaults.max_memtable_bytes
+        );
+        assert_eq!(
+            config.archive().partition_interval,
+            PartitionInterval::Month
+        );
+        assert_eq!(config.flush().max_age, FlushConfig::default().max_age);
+        assert_eq!(
+            config.compaction().max_files,
+            CompactConfig::default().max_files
+        );
+        assert_eq!(
+            config.parquet().zstd_level,
+            ParquetConfig::default().zstd_level
+        );
+        assert_eq!(config.ticks(), Ticks::default());
+    }
+
+    #[test]
+    fn an_absent_config_var_is_the_defaults() {
+        let config = FileConfig::resolve(|_| None).expect("defaults");
+        assert_eq!(
+            config.archive().partition_interval,
+            PartitionInterval::Month
+        );
+    }
+
+    /// A named file that cannot be read stops the start. An operator who wrote a
+    /// configuration meant it to take effect.
+    #[test]
+    fn a_named_file_that_is_missing_stops_the_start() {
+        let error = FileConfig::resolve(|name| {
+            (name == CONFIG_VAR).then(|| "/nonexistent/hetida.toml".to_owned())
+        })
+        .expect_err("must refuse");
+
+        assert!(
+            matches!(error, ConfigFileError::Unreadable { .. }),
+            "{error}"
+        );
+    }
+
+    /// The reason this file rejects unknown keys and `instance.meta` tolerates
+    /// them: this one is written by hand, and a misspelling that is silently
+    /// ignored is the costliest failure there is to find.
+    #[test]
+    fn a_misspelled_key_is_refused_rather_than_ignored() {
+        let error =
+            FileConfig::parse("[tables.readings]\nretenshun = \"90d\"\n").expect_err("must refuse");
+        assert!(error.contains("retenshun"), "{error}");
+
+        assert!(FileConfig::parse("max_memtable_bites = 10").is_err());
+        assert!(FileConfig::parse("[flsuh]\nmax_age = \"5m\"").is_err());
+    }
+
+    #[test]
+    fn the_whole_surface_round_trips() {
+        let config = parsed(
+            r#"
+            partition_interval = "day"
+            max_memtable_bytes = "2GiB"
+
+            [wal]
+            segment_bytes = "128MiB"
+            max_commit_delay = "25ms"
+
+            [flush]
+            max_bytes = "32MiB"
+            max_age = "2m"
+            tick = "5s"
+
+            [compaction]
+            max_files = 8
+            max_bytes = "512MiB"
+            target_bytes = "256MiB"
+            tick = "10m"
+
+            [parquet]
+            zstd_level = 9
+            row_group_rows = 65536
+
+            [retention]
+            tick = "30m"
+            "#,
+        );
+
+        let archive = config.archive();
+        assert_eq!(archive.partition_interval, PartitionInterval::Day);
+        assert_eq!(archive.max_memtable_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(archive.wal.segment_bytes, 128 * 1024 * 1024);
+        assert_eq!(archive.wal.max_commit_delay, Duration::from_millis(25));
+
+        assert_eq!(config.flush().max_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.flush().max_age, 2 * MINUTE);
+        assert_eq!(config.compaction().max_files, 8);
+        assert_eq!(config.compaction().target_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.parquet().zstd_level, 9);
+        assert_eq!(config.parquet().row_group_rows, 65_536);
+
+        assert_eq!(
+            config.ticks(),
+            Ticks {
+                flush: Duration::from_secs(5),
+                compaction: Duration::from_secs(600),
+                retention: Duration::from_secs(1800),
+            }
+        );
+    }
+
+    // ---- per-table configuration (§1, §6, §8) ----
+
+    /// §8: this is the setting the file exists for. Retention was implemented
+    /// and unreachable from the binary until now.
+    #[test]
+    fn a_table_can_be_given_a_retention_horizon() {
+        let config = parsed(
+            r#"
+            [tables.readings]
+            retention = "90d"
+            "#,
+        );
+        let archive = config.archive();
+
+        let (name, table) = archive.tables.first().expect("one table");
+        assert_eq!(name, "readings");
+        assert_eq!(table.retention, Some(90 * DAY));
+    }
+
+    /// §8: unset keeps forever. An archive nobody gave a horizon must not start
+    /// deleting because a file existed.
+    #[test]
+    fn a_table_without_retention_keeps_everything() {
+        let config = parsed(
+            r#"
+            [tables.readings]
+            suppression_window = "1h"
+            "#,
+        );
+        let (_, table) = config.archive().tables.first().expect("one table").clone();
+
+        assert_eq!(table.retention, None);
+        assert_eq!(table.suppression.window, HOUR);
+    }
+
+    /// §1, §6: the two suppression presets are what this setting is for — a job
+    /// recomputing hourly needs a window spanning its run interval, where a
+    /// stream needs minutes.
+    #[test]
+    fn suppression_is_configured_per_table_over_the_instance_default() {
+        let config = parsed(
+            r#"
+            [table_defaults]
+            suppression_window = "10m"
+            suppression_max_entries = 500000
+
+            [tables.forecast]
+            suppression_window = "1h"
+            "#,
+        );
+        let archive = config.archive();
+
+        assert_eq!(archive.default_table.suppression.window, 10 * MINUTE);
+        assert_eq!(archive.default_table.suppression.max_entries, 500_000);
+
+        let (_, forecast) = archive.tables.first().expect("forecast").clone();
+        assert_eq!(forecast.suppression.window, HOUR);
+        assert_eq!(
+            forecast.suppression.max_entries, 500_000,
+            "an override must set one field, not clear the rest"
+        );
+    }
+
+    /// A table section inherits the instance defaults rather than the compiled
+    /// ones, or naming a table would silently reset everything else about it.
+    #[test]
+    fn a_named_table_inherits_the_instance_defaults() {
+        let config = parsed(
+            r#"
+            [table_defaults]
+            retention = "30d"
+
+            [tables.readings]
+            suppression_window = "1h"
+            "#,
+        );
+        let (_, readings) = config.archive().tables.first().expect("readings").clone();
+
+        assert_eq!(
+            readings.retention,
+            Some(30 * DAY),
+            "the instance-wide horizon must still apply"
+        );
+        assert_eq!(readings.suppression.window, HOUR);
+    }
+
+    #[test]
+    fn several_tables_are_configured_independently() {
+        let config = parsed(
+            r#"
+            [tables.readings]
+            retention = "90d"
+
+            [tables.audit]
+            suppression_window = "1m"
+            "#,
+        );
+        let tables = config.archive().tables;
+
+        assert_eq!(tables.len(), 2);
+        let by_name: std::collections::BTreeMap<_, _> = tables.into_iter().collect();
+        assert_eq!(by_name["readings"].retention, Some(90 * DAY));
+        assert_eq!(by_name["audit"].retention, None);
+        assert_eq!(by_name["audit"].suppression.window, MINUTE);
+    }
+
+    #[test]
+    fn an_unknown_partition_interval_is_refused() {
+        let error = FileConfig::parse("partition_interval = \"fortnight\"").expect_err("refuse");
+        assert!(error.contains("fortnight"), "{error}");
+    }
+
+    /// The error has to name where the problem is, or an operator is left
+    /// bisecting a file.
+    #[test]
+    fn an_error_names_the_offending_value() {
+        let error = FileConfig::parse("[flush]\nmax_age = \"soon\"").expect_err("refuse");
+        assert!(error.contains("soon"), "{error}");
+    }
+}

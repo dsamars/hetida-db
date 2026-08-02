@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod catalog_log;
 pub mod clock;
 pub mod compact;
+pub mod config;
 pub mod data_log;
 pub mod flight;
 pub mod flush;

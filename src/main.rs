@@ -15,14 +15,14 @@ use anyhow::Context;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use tonic::transport::Server;
 
-use hetida_db::archive::{Archive, ArchiveConfig};
+use hetida_db::archive::Archive;
 use hetida_db::auth::{DEFAULT_TOKEN_TTL, SystemTokens, TokenIssuer};
 use hetida_db::clock::{Clock, SystemClock};
-use hetida_db::compact::{CompactConfig, Compactor, partition_dirs};
+use hetida_db::compact::{Compactor, partition_dirs};
+use hetida_db::config::FileConfig;
 use hetida_db::flight::BearerInterceptor;
 use hetida_db::flight::HetidaFlightService;
-use hetida_db::flush::{FlushConfig, FlushScheduler, Flusher};
-use hetida_db::parquet::ParquetConfig;
+use hetida_db::flush::{FlushScheduler, Flusher};
 use hetida_db::retention::Reaper;
 use hetida_db::serve::{AuthConfig, TransportConfig};
 use hetida_db::storage::FileStorage;
@@ -31,33 +31,23 @@ use hetida_db::storage::FileStorage;
 const DEFAULT_DATA_DIR: &str = "hetida-data";
 /// Address to serve on, unless `HETIDA_LISTEN` says otherwise.
 const DEFAULT_LISTEN: &str = "127.0.0.1:50051";
-/// How often the compactor looks for due partitions (§3).
-///
-/// Far less often than the flusher: compaction rewrites a whole partition, where
-/// a flush appends one file. Sharing the flusher's tick would either compact far
-/// more often than needed or flush far later than the age bound allows.
-const COMPACT_TICK: std::time::Duration = std::time::Duration::from_secs(300);
-/// How often the flusher looks for due partitions (§2).
-///
-/// Far below the age bound it enforces, so a partition is flushed close to when
-/// it becomes due rather than up to a whole tick late.
-const FLUSH_TICK: std::time::Duration = std::time::Duration::from_secs(10);
-/// How often the reaper looks for expired partitions (§8).
-///
-/// Comfortably below the finest partition interval, which is an hour (§11):
-/// nothing can become expired and be dropped more than a quarter of an interval
-/// late. Reaping more often would only relist directories that cannot yet have
-/// changed.
-const REAP_TICK: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let data_dir = std::env::var("HETIDA_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_owned());
     let listen = std::env::var("HETIDA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
 
+    // How the archive behaves comes from the file; where it is deployed and how
+    // it is secured comes from the environment. Nothing is settable in both, so
+    // there is never a question of which one won.
+    let file = FileConfig::resolve(|name| std::env::var(name).ok())
+        .context("the archive configuration could not be used")?;
+    let config = file.archive();
+    let parquet = file.parquet();
+    let ticks = file.ticks();
+
     let storage = Arc::new(FileStorage::new(PathBuf::from(&data_dir)));
     let storage_for_archive = Arc::clone(&storage);
-    let config = ArchiveConfig::default();
 
     let archive = Arc::new(
         Archive::open(storage_for_archive, &config, Arc::new(SystemClock))
@@ -94,12 +84,12 @@ async fn main() -> anyhow::Result<()> {
     // §2: one scheduler per table, driving flushes in the background so
     // ingestion never waits for one. Tables appear as clients write to them, so
     // the set is rebuilt on each tick rather than fixed at startup.
-    let flush_config = FlushConfig::default();
+    let flush_config = file.flush();
     let flushing = tokio::spawn({
         let archive = Arc::clone(&archive);
         let storage_for_flush = Arc::clone(&storage);
         async move {
-            let mut timer = tokio::time::interval(FLUSH_TICK);
+            let mut timer = tokio::time::interval(ticks.flush);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let clock: Arc<dyn hetida_db::clock::Clock> = Arc::new(SystemClock);
 
@@ -114,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
                             Arc::clone(&storage_for_flush) as Arc<_>,
                             table.clone(),
                             archive.interval(),
-                            ParquetConfig::default(),
+                            parquet,
                         ),
                         flush_config,
                         Arc::clone(&clock),
@@ -135,17 +125,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let compact_config = file.compaction();
     let compacting = tokio::spawn({
         let archive = Arc::clone(&archive);
         let storage = Arc::clone(&storage);
         async move {
-            let mut timer = tokio::time::interval(COMPACT_TICK);
+            let mut timer = tokio::time::interval(ticks.compaction);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let compactor = Compactor::new(
-                Arc::clone(&storage) as Arc<_>,
-                CompactConfig::default(),
-                ParquetConfig::default(),
-            );
+            let compactor = Compactor::new(Arc::clone(&storage) as Arc<_>, compact_config, parquet);
 
             loop {
                 timer.tick().await;
@@ -187,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
         let archive = Arc::clone(&archive);
         let storage = Arc::clone(&storage);
         async move {
-            let mut timer = tokio::time::interval(REAP_TICK);
+            let mut timer = tokio::time::interval(ticks.retention);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let reaper = Reaper::new(Arc::clone(&storage) as Arc<_>, archive.interval());
             let clock = SystemClock;

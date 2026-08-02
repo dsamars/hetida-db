@@ -53,7 +53,13 @@ prost = "0.14"
 # Entropy for bearer tokens (§9), through the OS. Only `OsRng` is used — a
 # seeded generator would make a token guessable from another one.
 rand = { version = "0.9", features = ["os_rng"] }
+# The archive configuration file (`HETIDA_CONFIG`). Derive only — nothing here
+# is on a hot path, and the file is read once at startup.
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# The configuration file's format. Same family as Cargo's own, so an operator
+# already knows the syntax.
+toml = "0.9"
 # Async runtime. Features kept to what the server needs: a multi-threaded
 # runtime, the test/main macros, TCP, and signal handling for shutdown.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
