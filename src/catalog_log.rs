@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Heiko Dietz
 
-//! Durable backing for the metric registry (§4, §10).
+//! The catalogue log: durable backing for everything that describes the
+//! archive rather than being part of it (§4, §6, §10).
 //!
 //! The registry is the one piece of state that never reaches Parquet, so §4's
 //! reclamation rule — drop a segment once its data is in Parquet — would destroy
 //! it. It therefore lives in its **own append-only log that is never
-//! reclaimed** ([`REGISTRY_LOG_DIR`], separate from [`DATA_LOG_DIR`]), sharing
+//! reclaimed** ([`CATALOG_LOG_DIR`], separate from [`DATA_LOG_DIR`]), sharing
 //! the record framing, group commit and recovery rule of the data log and
 //! differing only in that nothing here ever calls
 //! [`WalWriter::reclaim`](crate::wal::WalWriter::reclaim). The guarantee is
@@ -41,8 +42,8 @@ use crate::seq::SequenceSource;
 use crate::storage::Storage;
 use crate::wal::{RecordKind, Wal, WalError, replay};
 
-/// Directory holding the never-reclaimed registration log (§10).
-pub const REGISTRY_LOG_DIR: &str = "registry";
+/// Directory holding the never-reclaimed catalogue log (§4).
+pub const CATALOG_LOG_DIR: &str = "catalog";
 
 /// Directory holding the data log, the only one reclamation applies to (§4).
 pub const DATA_LOG_DIR: &str = "wal";
@@ -241,7 +242,7 @@ mod tests {
         let wal = Arc::new(
             Wal::open(
                 Arc::new(storage.clone()),
-                PathBuf::from(REGISTRY_LOG_DIR),
+                PathBuf::from(CATALOG_LOG_DIR),
                 config(),
             )
             .unwrap(),
@@ -253,7 +254,7 @@ mod tests {
     }
 
     fn recover(storage: &InMemoryStorage) -> RecoveredRegistrations {
-        replay_registrations(storage, &PathBuf::from(REGISTRY_LOG_DIR)).unwrap()
+        replay_registrations(storage, &PathBuf::from(CATALOG_LOG_DIR)).unwrap()
     }
 
     #[test]
@@ -349,8 +350,8 @@ mod tests {
     /// The two logs must not share a directory, or reclamation would find the
     /// registrations after all.
     #[test]
-    fn the_registration_log_is_not_the_data_log() {
-        assert_ne!(REGISTRY_LOG_DIR, DATA_LOG_DIR);
+    fn the_catalogue_log_is_not_the_data_log() {
+        assert_ne!(CATALOG_LOG_DIR, DATA_LOG_DIR);
     }
 
     /// §10: an id is returned only once its append is durable, so a record a
@@ -421,7 +422,7 @@ mod tests {
         registry.register(key("a", &[])).unwrap();
         registry.register(key("b", &[])).unwrap();
 
-        let records = crate::wal::replay(&storage, &PathBuf::from(REGISTRY_LOG_DIR))
+        let records = crate::wal::replay(&storage, &PathBuf::from(CATALOG_LOG_DIR))
             .unwrap()
             .records;
         let seqs: Vec<u64> = records.iter().map(|record| record.seq).collect();
@@ -440,7 +441,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         let wal = Wal::open(
             Arc::new(storage.clone()),
-            PathBuf::from(REGISTRY_LOG_DIR),
+            PathBuf::from(CATALOG_LOG_DIR),
             config(),
         )
         .unwrap();
