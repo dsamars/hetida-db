@@ -19,8 +19,8 @@
 //! evolution rules ([`schema`]), the metric registry ([`registry`]) with its
 //! never-reclaimed log ([`registry_log`]), the system-column stamper
 //! ([`stamp`]), the versioned table with freeze-and-swap ([`memtable`],
-//! [`active`]) and its suppression state ([`suppression`]), and the write-ahead
-//! log ([`wal`]).
+//! [`active`]) and its suppression state ([`suppression`]), the write-ahead log
+//! ([`wal`]) and the partition layout ([`partition`]).
 
 #![warn(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -28,6 +28,7 @@
 pub mod active;
 pub mod clock;
 pub mod memtable;
+pub mod partition;
 pub mod registry;
 pub mod registry_log;
 pub mod schema;

@@ -19,10 +19,13 @@ arc-swap = "1.9.2"
 # major or their types conflict across crate boundaries. datafusion 54.1
 # resolves arrow 58.4, so Phase 3 must add datafusion 54.x, not a newer line.
 arrow = "58.4"
+# Calendar arithmetic for the Hive-style partition layout (§11). Pinned to the
+# version arrow already resolves, so only one chrono is in the graph.
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 crc32fast = "1.5.0"
 dashmap = "6.2.1"
 thiserror = "2"
-# Payload digests for §1 retransmission suppression. Non-cryptographic is
+# Payload digests for §1 unchanged-value suppression. Non-cryptographic is
 # sufficient: the comparison is not adversarial — a client constructing a
 # collision would only discard its own correction, which it could equally
 # achieve by not sending it.
