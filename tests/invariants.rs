@@ -4,13 +4,12 @@
 //! Property-based invariant suite.
 //!
 //! Examples cannot cover the invariants this archive rests on, so they are
-//! stated as properties over generated input. Alongside the Phase 0 foundation
-//! it holds the first of the three §1 invariants, suppression being idempotent,
-//! and the §8 retention rules — that a dropped partition never took a row
-//! younger than the cutoff, and that rejection on ingest and reaping on disk are
-//! the same rule seen from two sides. The remaining two §1 invariants — version
-//! resolution at arbitrary observation points, and sort order surviving flush
-//! and compaction — join them once the components they describe exist.
+//! stated as properties over generated input. All three §1 invariants are here
+//! — suppression being idempotent, version resolution answering correctly at an
+//! arbitrary observation point, and sort order surviving flush and compaction —
+//! together with the §8 retention rules: that a dropped partition never took a
+//! row younger than the cutoff, and that rejection on ingest and reaping on disk
+//! are the same rule seen from two sides.
 //!
 //! Being an integration test, this also proves the injection points are
 //! reachable and object-safe from outside the crate. A test double that only
@@ -25,10 +24,17 @@ use std::time::Duration;
 use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use hetida_db::active::ActiveMemTable;
+use hetida_db::archive::{Archive, ArchiveConfig};
 use hetida_db::clock::{Clock, Micros, TestClock};
+use hetida_db::compact::{CompactConfig, Compactor, keys_of, partition_dirs};
+use hetida_db::flush::Flusher;
+use hetida_db::parquet::ParquetConfig;
 use hetida_db::partition::PartitionInterval;
+use hetida_db::query::QueryEngine;
+use hetida_db::registry::MetricId;
 use hetida_db::retention::{Reaper, is_expired};
 use hetida_db::schema::{METRIC_ID_COLUMN, TIMESTAMP_COLUMN, append_system_fields, timestamp_type};
+use hetida_db::seq::Seq as SeqNumber;
 use hetida_db::seq::{AtomicSequence, Seq, SequenceSource};
 use hetida_db::stamp::Stamper;
 use hetida_db::storage::{Fault, InMemoryStorage, Storage};
@@ -382,5 +388,215 @@ proptest! {
         let stored = storage.read(path)?;
         prop_assert!(intended.starts_with(&stored));
         prop_assert_eq!(stored.len(), keep.min(intended.len()));
+    }
+}
+
+// ---- the two §1 invariants that needed the query and archive paths ----
+
+/// 2026-08-02T14:37:12Z — inside a month, so a partition holds a real interval.
+const AUGUST: Micros = 1_785_681_432_000_000;
+/// Ingest-time distance between two successive writes in a generated run.
+const STEP: Micros = 1_000;
+
+fn archive(storage: &InMemoryStorage, clock: Arc<TestClock>) -> Archive {
+    Archive::open(
+        Arc::new(storage.clone()),
+        &ArchiveConfig {
+            wal: WalConfig {
+                segment_bytes: 64 * 1024,
+                max_commit_delay: Duration::ZERO,
+            },
+            ..ArchiveConfig::default()
+        },
+        clock,
+    )
+    .expect("archive")
+}
+
+fn flusher(storage: &InMemoryStorage) -> Flusher {
+    Flusher::new(
+        Arc::new(storage.clone()),
+        "readings",
+        PartitionInterval::Month,
+        ParquetConfig::default(),
+    )
+}
+
+/// Every `(metric_id, timestamp, seq)` on disk for `readings`, in file order.
+fn keys_on_disk(storage: &InMemoryStorage) -> Vec<Vec<(MetricId, Micros, SeqNumber)>> {
+    let mut per_file = Vec::new();
+    for directory in partition_dirs(storage, "readings", PartitionInterval::Month).expect("dirs") {
+        for file in storage.list(&directory).expect("files") {
+            per_file.push(keys_of(storage, &file).expect("keys"));
+        }
+    }
+    per_file
+}
+
+proptest! {
+    /// §1: the invariant time travel rests on. For an arbitrary run of writes
+    /// and corrections, and an arbitrary observation point, the archive must
+    /// answer with the version that was current at that point — no matter
+    /// whether the version in question is still in memory, in a memtable a
+    /// flush has in flight, or already in Parquet.
+    ///
+    /// The expected answer is computed here, independently: the last write to a
+    /// logical row at or before the point. Suppression cannot change it, since a
+    /// suppressed write carries the value it was compared against.
+    #[test]
+    fn resolution_answers_the_version_current_at_any_observation_point(
+        writes in prop::collection::vec((0u64..3, 0i64..3, 0i64..4), 1..10),
+        flushes in prop::collection::vec(any::<bool>(), 10),
+        offset in -1i64..12_000,
+    ) {
+        let storage = InMemoryStorage::new();
+        let clock = Arc::new(TestClock::new(AUGUST));
+        let archive = Arc::new(archive(&storage, Arc::clone(&clock)));
+        let flusher = flusher(&storage);
+
+        // The model: what each logical row's value was, at each system time.
+        let mut expected: std::collections::BTreeMap<(u64, Micros), f64> =
+            std::collections::BTreeMap::new();
+        let observe = AUGUST + offset;
+
+        for (index, (metric, slot, value)) in writes.iter().enumerate() {
+            let stamped_at = AUGUST + index as Micros * STEP;
+            clock.set(stamped_at);
+
+            let timestamp = AUGUST + slot * 86_400_000_000;
+            archive
+                .ingest("readings", &client_row(*metric, timestamp, *value as f64))
+                .expect("ingest");
+
+            // Only writes at or before the observation point are visible from it.
+            if stamped_at <= observe {
+                expected.insert((*metric, timestamp), *value as f64);
+            }
+
+            // A flush here moves everything written so far to Parquet, so the
+            // point may fall on either side of the memory/disk boundary.
+            if flushes.get(index).copied().unwrap_or(false)
+                && let Some(state) = archive.table("readings")
+            {
+                for start in state.partition_starts() {
+                    flusher.flush(&state, start).expect("flush");
+                }
+            }
+        }
+
+        let engine = QueryEngine::new(Arc::clone(&archive), Arc::new(storage.clone()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let batches = runtime
+            .block_on(engine.collect("SELECT * FROM readings", Some(observe)))
+            .expect("query");
+
+        let mut answered: std::collections::BTreeMap<(u64, Micros), f64> =
+            std::collections::BTreeMap::new();
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("metric_id")
+                .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                .expect("metric_id");
+            let stamps = batch
+                .column_by_name("timestamp")
+                .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .expect("timestamp");
+            let values = batch
+                .column_by_name("value")
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                .expect("value");
+            for row in 0..batch.num_rows() {
+                answered.insert((ids.value(row), stamps.value(row)), values.value(row));
+            }
+        }
+
+        prop_assert_eq!(
+            answered,
+            expected,
+            "observation point {} answered with the wrong versions",
+            observe
+        );
+    }
+
+    /// §1: every flushed and compacted file is ordered by
+    /// `(metric_id, timestamp, seq)`, and no version is lost on the way. Version
+    /// resolution is a streaming merge over exactly that order and silently
+    /// degrades to a full sort if it is broken — silently, which is why this is
+    /// a property and not an example.
+    #[test]
+    fn sort_order_and_every_version_survive_flush_and_compaction(
+        rows in prop::collection::vec((0u64..4, 0i64..3, 0i64..3), 1..24),
+        flushes in prop::collection::vec(any::<bool>(), 24),
+    ) {
+        let storage = InMemoryStorage::new();
+        let clock = Arc::new(TestClock::new(AUGUST));
+        let archive = archive(&storage, Arc::clone(&clock));
+        let flusher = flusher(&storage);
+
+        let flush_all = |archive: &Archive| {
+            if let Some(state) = archive.table("readings") {
+                for start in state.partition_starts() {
+                    flusher.flush(&state, start).expect("flush");
+                }
+            }
+        };
+
+        for (index, (metric, slot, value)) in rows.iter().enumerate() {
+            clock.set(AUGUST + index as Micros * STEP);
+            archive
+                .ingest(
+                    "readings",
+                    &client_row(*metric, AUGUST + slot * 86_400_000_000, *value as f64),
+                )
+                .expect("ingest");
+            if flushes.get(index).copied().unwrap_or(false) {
+                flush_all(&archive);
+            }
+        }
+        flush_all(&archive);
+
+        // Sorted within every file, before anything is merged.
+        let before = keys_on_disk(&storage);
+        for file in &before {
+            let mut sorted = file.clone();
+            sorted.sort_unstable();
+            prop_assert_eq!(file, &sorted, "a flushed file is out of order");
+        }
+
+        // Compaction re-sorts and merges, and must change neither.
+        let compactor = Compactor::new(
+            Arc::new(storage.clone()),
+            CompactConfig {
+                max_files: 2,
+                max_bytes: usize::MAX,
+                target_bytes: usize::MAX,
+            },
+            ParquetConfig::default(),
+        );
+        for directory in
+            partition_dirs(&storage, "readings", PartitionInterval::Month).expect("dirs")
+        {
+            compactor.compact_if_due(&directory).expect("compact");
+        }
+
+        let after = keys_on_disk(&storage);
+        for file in &after {
+            let mut sorted = file.clone();
+            sorted.sort_unstable();
+            prop_assert_eq!(file, &sorted, "a compacted file is out of order");
+        }
+
+        let flatten = |files: &[Vec<(MetricId, Micros, SeqNumber)>]| {
+            let mut all: Vec<_> = files.iter().flatten().copied().collect();
+            all.sort_unstable();
+            all
+        };
+        prop_assert_eq!(
+            flatten(&after),
+            flatten(&before),
+            "compaction lost or invented a version"
+        );
     }
 }

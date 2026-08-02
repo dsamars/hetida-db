@@ -39,7 +39,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DataFusionError, Result as DataFusionResult, ScalarValue};
+use datafusion::common::{
+    Column, DFSchema, DataFusionError, Result as DataFusionResult, ScalarValue,
+};
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{
     ColumnarValue, Expr, LogicalPlan, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -115,7 +117,11 @@ impl LabelPushdown {
     }
 
     /// The rewrite of one expression, if it is a call to the marker.
-    fn rewrite(&self, expr: Expr) -> DataFusionResult<Transformed<Expr>> {
+    ///
+    /// `schema` is what the expression resolves against, and the rewritten
+    /// column has to be qualified the same way the surrounding predicate is —
+    /// see [`metric_id_column`].
+    fn rewrite(&self, expr: Expr, schema: &DFSchema) -> DataFusionResult<Transformed<Expr>> {
         let Expr::ScalarFunction(call) = &expr else {
             return Ok(Transformed::no(expr));
         };
@@ -136,6 +142,7 @@ impl LabelPushdown {
         };
 
         Ok(Transformed::yes(ids_predicate(
+            metric_id_column(schema),
             &self.registry.matching(&label, &value),
         )))
     }
@@ -148,23 +155,47 @@ impl AnalyzerRule for LabelPushdown {
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> DataFusionResult<LogicalPlan> {
         plan.transform_up(|node| {
-            node.map_expressions(|expr| expr.transform_up(|inner| self.rewrite(inner)))
+            // A node's expressions resolve against its input, not against what
+            // it produces — a `Filter`'s predicate names the columns beneath it.
+            let schema = node.inputs().first().map_or_else(
+                || Arc::clone(node.schema()),
+                |input| Arc::clone(input.schema()),
+            );
+            node.map_expressions(|expr| expr.transform_up(|inner| self.rewrite(inner, &schema)))
         })
         .map(|transformed| transformed.data)
     }
 }
 
 /// `metric_id IN (…)`, or `false` when nothing carries the label.
-fn ids_predicate(ids: &[MetricId]) -> Expr {
+fn ids_predicate(column: Expr, ids: &[MetricId]) -> Expr {
     if ids.is_empty() {
         return lit(false);
     }
-    datafusion::prelude::col(METRIC_ID_COLUMN).in_list(
+    column.in_list(
         ids.iter()
             .map(|id| lit(ScalarValue::UInt64(Some(*id))))
             .collect(),
         false,
     )
+}
+
+/// The `metric_id` column, qualified as the surrounding plan qualifies it.
+///
+/// This is not cosmetic. A predicate the analyzer injects unqualified does not
+/// match the one the planner resolved, and filter pushdown then leaves it above
+/// the aggregate instead of handing it to the scan — where it would have become
+/// the row-group pruning §11 depends on. The predicate still answers correctly;
+/// it just reads the whole file to do it, which is the failure mode a byte count
+/// catches and an assertion on rows never would.
+///
+/// Falls back to an unqualified column when the schema has no `metric_id`, which
+/// leaves the planner to report the unresolved name as it would for any other.
+fn metric_id_column(schema: &DFSchema) -> Expr {
+    match schema.qualified_field_with_unqualified_name(METRIC_ID_COLUMN) {
+        Ok((qualifier, field)) => Expr::Column(Column::new(qualifier.cloned(), field.name())),
+        Err(_) => datafusion::prelude::col(METRIC_ID_COLUMN),
+    }
 }
 
 /// The text a literal carries, if it is a string literal.
@@ -188,18 +219,50 @@ fn string_literal(expr: &Expr) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn unqualified() -> Expr {
+        datafusion::prelude::col(METRIC_ID_COLUMN)
+    }
+
+    /// §11: the qualifier is not cosmetic. A column the analyzer injects
+    /// unqualified does not match the one the planner resolved, and filter
+    /// pushdown then leaves the predicate above the aggregate instead of handing
+    /// it to the scan — where it becomes row-group pruning. The answer stays
+    /// correct either way, which is exactly why this needs pinning here and a
+    /// byte count in the verification suite.
+    #[test]
+    fn the_rewritten_column_is_qualified_like_the_plan_it_lands_in() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::DFSchema;
+
+        let arrow = Schema::new(vec![Field::new(METRIC_ID_COLUMN, DataType::UInt64, false)]);
+        let schema = DFSchema::try_from_qualified_schema("readings", &arrow).expect("schema");
+
+        assert_eq!(
+            metric_id_column(&schema).to_string(),
+            format!("readings.{METRIC_ID_COLUMN}")
+        );
+    }
+
+    /// A schema without the column leaves the name unresolved for the planner
+    /// to report, rather than inventing a qualifier that names nothing.
+    #[test]
+    fn an_absent_column_falls_back_to_the_bare_name() {
+        let schema = datafusion::common::DFSchema::empty();
+        assert_eq!(metric_id_column(&schema).to_string(), METRIC_ID_COLUMN);
+    }
+
     #[test]
     fn a_label_nothing_carries_becomes_false_not_everything() {
         // The honest reading: no row can carry a label no series has. `true`
         // would silently widen the question the client asked.
-        assert_eq!(ids_predicate(&[]), lit(false));
+        assert_eq!(ids_predicate(unqualified(), &[]), lit(false));
     }
 
     /// §10, §11: a resolved label becomes literals on `metric_id`, which is
     /// what the writer's min/max statistics can prune on.
     #[test]
     fn resolved_ids_become_a_literal_in_list_on_metric_id() {
-        let predicate = ids_predicate(&[7, 9]);
+        let predicate = ids_predicate(unqualified(), &[7, 9]);
         let rendered = predicate.to_string();
 
         assert!(rendered.contains(METRIC_ID_COLUMN), "{rendered}");
