@@ -48,10 +48,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use arrow::error::ArrowError;
 use arrow::ipc::convert::try_schema_from_ipc_buffer;
 use arrow::ipc::writer::StreamWriter;
 
+use crate::catalog::{CatalogueError, SchemaLog};
 use crate::registry::{MetricId, Registration, RegistrationLog, RegistryError, SeriesKey};
 use crate::seq::SequenceSource;
 use crate::storage::Storage;
@@ -62,17 +62,6 @@ pub const CATALOG_LOG_DIR: &str = "catalog";
 
 /// Directory holding the data log, the only one reclamation applies to (§4).
 pub const DATA_LOG_DIR: &str = "wal";
-
-/// Why a schema could not be made durable.
-#[derive(Debug, thiserror::Error)]
-pub enum SchemaLogError {
-    /// The schema could not be encoded, so nothing was written.
-    #[error("could not encode the schema: {0}")]
-    Encoding(#[from] ArrowError),
-    /// The record could not be made durable, so the schema was not published.
-    #[error("could not persist the schema: {0}")]
-    Persistence(Box<dyn std::error::Error + Send + Sync>),
-}
 
 /// One table's schema, as accepted or evolved (§6).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,11 +118,17 @@ impl WalCatalogLog {
     ///
     /// Returns only once it is durable, so the catalogue may publish the evolved
     /// schema afterwards and never before.
-    pub fn append_schema(&self, record: &SchemaRecord) -> Result<(), SchemaLogError> {
+    pub fn append_schema(&self, record: &SchemaRecord) -> Result<(), CatalogueError> {
         let payload = encode_schema(record)?;
         self.wal
             .append(RecordKind::Schema, self.sequence.next(), payload)
-            .map_err(|error| SchemaLogError::Persistence(Box::new(error)))
+            .map_err(|error| CatalogueError::Persistence(Box::new(error)))
+    }
+}
+
+impl SchemaLog for WalCatalogLog {
+    fn append(&self, record: &SchemaRecord) -> Result<(), CatalogueError> {
+        self.append_schema(record)
     }
 }
 
@@ -191,7 +186,7 @@ pub fn replay_catalog(storage: &dyn Storage, dir: &Path) -> Result<RecoveredCata
 /// The schema itself goes through Arrow's own encoder rather than a hand-rolled
 /// one — a `Schema` carries nested types, metadata and nullability, and
 /// re-implementing that is how a field quietly loses a property.
-fn encode_schema(record: &SchemaRecord) -> Result<Vec<u8>, SchemaLogError> {
+fn encode_schema(record: &SchemaRecord) -> Result<Vec<u8>, CatalogueError> {
     let mut writer = StreamWriter::try_new(Vec::new(), record.schema.as_ref())?;
     writer.finish()?;
     let ipc = writer.into_inner()?;

@@ -21,6 +21,7 @@ use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64A
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use hetida_db::active::ActiveMemTable;
+use hetida_db::catalog::{TableCatalogue, TableConfig};
 use hetida_db::catalog_log::{CATALOG_LOG_DIR, WalCatalogLog, replay_catalog};
 use hetida_db::clock::{Micros, TestClock};
 use hetida_db::instance::InstanceMetadata;
@@ -366,4 +367,64 @@ fn a_suppressed_run_does_not_move_the_resolved_system_time() {
         "the surviving version must still be the one that introduced the value"
     );
     assert_eq!(active.current().num_rows(), 1);
+}
+
+/// §6: the reason the schema is durable at all. A restart rebuilds the catalogue
+/// from the same log the registrations come from, and the type-change rejection
+/// still works afterwards — without it a client sending a conflicting type would
+/// be admitted and the clash would surface later as unreadable Parquet.
+#[test]
+fn a_restart_keeps_rejecting_a_type_change() {
+    let storage = InMemoryStorage::new();
+    let sequence = Arc::new(AtomicSequence::starting_at(0));
+
+    let log = Arc::new(
+        Wal::open(
+            Arc::new(storage.clone()),
+            std::path::PathBuf::from(CATALOG_LOG_DIR),
+            wal_config(),
+        )
+        .expect("catalogue log"),
+    );
+    let catalog_log = Arc::new(WalCatalogLog::new(log, Arc::clone(&sequence) as Arc<_>));
+
+    // ---- first run: the table is created and evolved ----
+    {
+        let catalogue =
+            TableCatalogue::new(Arc::clone(&catalog_log) as Arc<_>, TableConfig::default());
+        catalogue
+            .accept("readings", &client_schema())
+            .expect("accept");
+
+        let mut wider = client_schema().fields().to_vec();
+        wider.push(Arc::new(Field::new("quality", DataType::Int32, true)));
+        catalogue
+            .accept("readings", &Schema::new(wider))
+            .expect("evolve");
+    }
+
+    // ---- restart: rebuild the catalogue from the log ----
+    let recovered =
+        replay_catalog(&storage, std::path::Path::new(CATALOG_LOG_DIR)).expect("replay");
+    assert_eq!(recovered.schemas.len(), 2, "creation and evolution");
+
+    let catalogue = TableCatalogue::new(Arc::clone(&catalog_log) as Arc<_>, TableConfig::default());
+    catalogue.replay(recovered.schemas).expect("replay schemas");
+
+    let restored = catalogue.schema("readings").expect("readings");
+    assert!(
+        restored.logical().field_with_name("quality").is_ok(),
+        "the evolution must survive the restart"
+    );
+
+    // The conflicting type must still be refused.
+    let conflicting = Schema::new(vec![
+        Field::new(TIMESTAMP_COLUMN, timestamp_type(), false),
+        Field::new(METRIC_ID_COLUMN, DataType::UInt64, false),
+        Field::new("value", DataType::Int64, true),
+    ]);
+    assert!(
+        catalogue.accept("readings", &conflicting).is_err(),
+        "a recorded schema must keep refusing a conflicting type after a restart"
+    );
 }

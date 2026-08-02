@@ -17,7 +17,7 @@ Every task is executed test-first: its tests are written and failing before any 
 
 ## Phase 1: Data Model & Ingestion Engine
 - [x] Define the Arrow schema model (`timestamp`, `metric_id` as `u64`, attributes as real typed payload columns) with evolution rules: nullable column added = accept, column missing = null, type change = reject. Reject client schemas supplying the reserved `system_time`/`seq` columns (§6, §10).
-- [ ] Build the multi-table catalogue mapping table name to its durable `TableSchema` — recorded in the catalogue log (§4) — and its per-table configuration — suppression window and entry cap (§1), retention duration (§8) — applying evolution on ingest and surfacing rejections as explicit Flight errors (§6).
+- [x] Build the multi-table catalogue mapping table name to its durable `TableSchema` — recorded in the catalogue log (§4) — and its per-table configuration, applying evolution on ingest (§1, §6). *Retention duration joins `TableConfig` with §8; surfacing rejections as Flight errors lands with `do_put`.*
 - [x] Build the metric registry mapping name + label set to a `u64` id, idempotent on re-registration, durable before visible through a `RegistrationLog` seam (§10).
 - [x] Back the registry's `RegistrationLog` with the never-reclaimed catalogue log and recover it on start, skipping a torn tail (§4, §10). *The startup sequence that replays it ahead of the data log lands with `do_put`; the ordering rule is recorded in §4.*
 - [ ] Implement the Flight registration action returning ids for a name and label set, so clients resolve once and cache (§10).

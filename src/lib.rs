@@ -16,7 +16,8 @@
 //!
 //! Implemented so far: the Phase 0 test foundation ([`clock`], [`seq`],
 //! [`storage`]) and most of the Phase 1 data model — table schemas with their
-//! evolution rules ([`schema`]), the metric registry ([`registry`]) backed by the
+//! evolution rules ([`schema`]) and the catalogue that applies them
+//! ([`catalog`]), the metric registry ([`registry`]) backed by the
 //! never-reclaimed catalogue log ([`catalog_log`]), the system-column stamper
 //! ([`stamp`]), the versioned table with freeze-and-swap ([`memtable`],
 //! [`active`]) and its suppression state ([`suppression`]), the write-ahead log
@@ -26,6 +27,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod active;
+pub mod catalog;
 pub mod catalog_log;
 pub mod clock;
 pub mod instance;
