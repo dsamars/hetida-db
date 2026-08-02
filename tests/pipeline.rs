@@ -21,7 +21,7 @@ use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64A
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use hetida_db::active::ActiveMemTable;
-use hetida_db::catalog_log::{CATALOG_LOG_DIR, WalRegistrationLog, replay_registrations};
+use hetida_db::catalog_log::{CATALOG_LOG_DIR, WalCatalogLog, replay_catalog};
 use hetida_db::clock::{Micros, TestClock};
 use hetida_db::instance::InstanceMetadata;
 use hetida_db::memtable::RowKey;
@@ -91,7 +91,7 @@ fn logged_registry(storage: &InMemoryStorage, sequence: Arc<AtomicSequence>) -> 
         )
         .expect("registration log"),
     );
-    MetricRegistry::new(Arc::new(WalRegistrationLog::new(log, sequence)))
+    MetricRegistry::new(Arc::new(WalCatalogLog::new(log, sequence)))
 }
 
 fn series(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
@@ -139,8 +139,8 @@ fn a_restart_recovers_the_registry_and_the_layout() {
         "the layout must survive the restart, not be re-chosen"
     );
 
-    let recovered = replay_registrations(&storage, std::path::Path::new(CATALOG_LOG_DIR))
-        .expect("replay registrations");
+    let recovered =
+        replay_catalog(&storage, std::path::Path::new(CATALOG_LOG_DIR)).expect("replay catalogue");
     assert_eq!(recovered.registrations.len(), 3);
     assert_eq!(recovered.undecodable, 0);
 

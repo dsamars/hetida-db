@@ -50,6 +50,8 @@ pub enum RecordKind {
     Registration = 2,
     /// Everything at or below this `seq` is in Parquet (§4).
     Checkpoint = 3,
+    /// A table's schema, as accepted or evolved (§6).
+    Schema = 4,
 }
 
 impl RecordKind {
@@ -59,6 +61,7 @@ impl RecordKind {
             1 => Some(Self::Data),
             2 => Some(Self::Registration),
             3 => Some(Self::Checkpoint),
+            4 => Some(Self::Schema),
             _ => None,
         }
     }

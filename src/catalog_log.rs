@@ -4,38 +4,53 @@
 //! The catalogue log: durable backing for everything that describes the
 //! archive rather than being part of it (§4, §6, §10).
 //!
-//! The registry is the one piece of state that never reaches Parquet, so §4's
-//! reclamation rule — drop a segment once its data is in Parquet — would destroy
-//! it. It therefore lives in its **own append-only log that is never
-//! reclaimed** ([`CATALOG_LOG_DIR`], separate from [`DATA_LOG_DIR`]), sharing
-//! the record framing, group commit and recovery rule of the data log and
-//! differing only in that nothing here ever calls
+//! Metric registrations (§10) and table schemas (§6) are the state that explains
+//! the archive but is never part of it, so neither reaches Parquet. §4's
+//! reclamation rule — drop a segment once its data is in Parquet — would
+//! therefore destroy both. They live in this **append-only log that is never
+//! reclaimed** ([`CATALOG_LOG_DIR`], separate from [`DATA_LOG_DIR`]), sharing the
+//! record framing, group commit and recovery rule of the data log and differing
+//! only in that nothing here ever calls
 //! [`WalWriter::reclaim`](crate::wal::WalWriter::reclaim). The guarantee is
 //! structural rather than conditional: no code path exists that could delete a
-//! registration.
+//! catalogue record.
+//!
+//! One log rather than two, because registrations and schemas share every
+//! property that matters — never reclaimed, tiny, append-only, replayed before
+//! the data log — and one log is one replay and one recovery rule.
 //!
 //! # What the log holds
 //!
-//! Exactly one record per series. Idempotence is settled in memory before the
-//! log is touched (see [`MetricRegistry::register`](crate::registry::MetricRegistry::register)), so a duplicate is never
-//! written and there is nothing to compact. Its size is bounded by series
-//! cardinality, not ingest volume.
+//! One record per series, and one per accepted schema change. Both are settled in
+//! memory before the log is touched — registration by
+//! [`MetricRegistry::register`](crate::registry::MetricRegistry::register)'s
+//! idempotence, a schema by the catalogue finding the batch already conformant —
+//! so a repeat is never written and there is nothing to compact. Size is bounded
+//! by series cardinality plus the number of evolutions, not by ingest volume.
+//!
+//! Schema records accumulate rather than replace: the newest record for a table
+//! is its current schema, and the earlier ones are history (§6).
 //!
 //! # Recovery
 //!
-//! [`replay_registrations`] reads the log and hands the result to
-//! [`MetricRegistry::replay`](crate::registry::MetricRegistry::replay). It never fails on damage: a torn tail record is
-//! by construction an id no client ever saw, because [`RegistrationLog::append`]
-//! returns only once the record is durable and the id is returned only after
-//! that. Discarding it and handing the id to another series is sound, and
-//! numbering resumes past the highest surviving id.
+//! [`replay_catalog`] reads the log and separates what it finds.
+//! [`MetricRegistry::replay`](crate::registry::MetricRegistry::replay) takes the
+//! registrations. It never fails on damage: a torn tail record is by construction
+//! a change no caller ever saw, because an append returns only once the record is
+//! durable and the result is published only after that. Discarding it is sound —
+//! an id is handed to another series, an evolution is simply not yet applied.
 //!
-//! At startup this log is replayed **before** the data log, so every id a data
-//! record refers to is already resolvable.
+//! At startup this log is replayed **before** the data log, so every id and every
+//! schema is known before the data referring to them is read.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
+use arrow::ipc::convert::try_schema_from_ipc_buffer;
+use arrow::ipc::writer::StreamWriter;
 
 use crate::registry::{MetricId, Registration, RegistrationLog, RegistryError, SeriesKey};
 use crate::seq::SequenceSource;
@@ -48,11 +63,34 @@ pub const CATALOG_LOG_DIR: &str = "catalog";
 /// Directory holding the data log, the only one reclamation applies to (§4).
 pub const DATA_LOG_DIR: &str = "wal";
 
-/// What a registration replay recovered.
+/// Why a schema could not be made durable.
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaLogError {
+    /// The schema could not be encoded, so nothing was written.
+    #[error("could not encode the schema: {0}")]
+    Encoding(#[from] ArrowError),
+    /// The record could not be made durable, so the schema was not published.
+    #[error("could not persist the schema: {0}")]
+    Persistence(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// One table's schema, as accepted or evolved (§6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaRecord {
+    /// Name of the table the schema belongs to.
+    pub table: String,
+    /// The schema as of this record.
+    pub schema: SchemaRef,
+}
+
+/// What a catalogue replay recovered.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct RecoveredRegistrations {
+pub struct RecoveredCatalog {
     /// Registrations in the order they were logged.
     pub registrations: Vec<Registration>,
+    /// Schema records in the order they were logged, so the last one for a
+    /// table is its current schema (§6).
+    pub schemas: Vec<SchemaRecord>,
     /// Segment whose tail was discarded, if any.
     pub truncated: Option<PathBuf>,
     /// Records that passed their CRC but could not be decoded, and were skipped.
@@ -63,17 +101,21 @@ pub struct RecoveredRegistrations {
     pub undecodable: usize,
 }
 
-/// [`RegistrationLog`] writing through a never-reclaimed [`Wal`].
+/// Writes catalogue records through a never-reclaimed [`Wal`].
+///
+/// Implements [`RegistrationLog`] for the registry and offers
+/// [`Self::append_schema`] for the catalogue, so both halves of the catalogue
+/// reach one log.
 ///
 /// Holds the log by `Arc` so the caller keeps it alive; dropping the last handle
 /// joins the writer thread and so guarantees the final group reached the device.
-pub struct WalRegistrationLog {
+pub struct WalCatalogLog {
     wal: Arc<Wal>,
     sequence: Arc<dyn SequenceSource>,
 }
 
-impl WalRegistrationLog {
-    /// Persists registrations through `wal`, numbering them from `sequence`.
+impl WalCatalogLog {
+    /// Persists catalogue records through `wal`, numbering them from `sequence`.
     ///
     /// `sequence` must be the same source the data path draws from, so the order
     /// between a registration and a write stays defined (§4). The gaps this
@@ -82,17 +124,28 @@ impl WalRegistrationLog {
     pub fn new(wal: Arc<Wal>, sequence: Arc<dyn SequenceSource>) -> Self {
         Self { wal, sequence }
     }
+
+    /// Records `record` as the current schema of its table (§6).
+    ///
+    /// Returns only once it is durable, so the catalogue may publish the evolved
+    /// schema afterwards and never before.
+    pub fn append_schema(&self, record: &SchemaRecord) -> Result<(), SchemaLogError> {
+        let payload = encode_schema(record)?;
+        self.wal
+            .append(RecordKind::Schema, self.sequence.next(), payload)
+            .map_err(|error| SchemaLogError::Persistence(Box::new(error)))
+    }
 }
 
-impl fmt::Debug for WalRegistrationLog {
+impl fmt::Debug for WalCatalogLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WalRegistrationLog")
+        f.debug_struct("WalCatalogLog")
             .field("wal", &self.wal)
             .finish_non_exhaustive()
     }
 }
 
-impl RegistrationLog for WalRegistrationLog {
+impl RegistrationLog for WalCatalogLog {
     fn append(&self, registration: &Registration) -> Result<(), RegistryError> {
         self.wal
             .append(
@@ -104,33 +157,61 @@ impl RegistrationLog for WalRegistrationLog {
     }
 }
 
-/// Reads every registration from the log under `dir`.
+/// Reads the whole catalogue back from the log under `dir`.
 ///
 /// Never fails on damage — see the module documentation.
-pub fn replay_registrations(
-    storage: &dyn Storage,
-    dir: &Path,
-) -> Result<RecoveredRegistrations, WalError> {
+pub fn replay_catalog(storage: &dyn Storage, dir: &Path) -> Result<RecoveredCatalog, WalError> {
     let replayed = replay(storage, dir)?;
-    let mut recovered = RecoveredRegistrations {
+    let mut recovered = RecoveredCatalog {
         truncated: replayed.truncated,
-        ..RecoveredRegistrations::default()
+        ..RecoveredCatalog::default()
     };
 
     for record in replayed.records {
-        // The log holds nothing else, but a foreign kind is damage rather than a
-        // reason to stop reading.
-        if record.kind != RecordKind::Registration {
-            recovered.undecodable += 1;
-            continue;
-        }
-        match decode(&record.payload) {
-            Some(registration) => recovered.registrations.push(registration),
-            None => recovered.undecodable += 1,
+        match record.kind {
+            RecordKind::Registration => match decode(&record.payload) {
+                Some(registration) => recovered.registrations.push(registration),
+                None => recovered.undecodable += 1,
+            },
+            RecordKind::Schema => match decode_schema(&record.payload) {
+                Some(schema) => recovered.schemas.push(schema),
+                None => recovered.undecodable += 1,
+            },
+            // The log holds nothing else, so a foreign kind is damage rather
+            // than a reason to stop reading.
+            _ => recovered.undecodable += 1,
         }
     }
 
     Ok(recovered)
+}
+
+/// Encodes a schema record: the table name, then the schema in Arrow IPC form.
+///
+/// The schema itself goes through Arrow's own encoder rather than a hand-rolled
+/// one — a `Schema` carries nested types, metadata and nullability, and
+/// re-implementing that is how a field quietly loses a property.
+fn encode_schema(record: &SchemaRecord) -> Result<Vec<u8>, SchemaLogError> {
+    let mut writer = StreamWriter::try_new(Vec::new(), record.schema.as_ref())?;
+    writer.finish()?;
+    let ipc = writer.into_inner()?;
+
+    let mut bytes = Vec::with_capacity(8 + record.table.len() + ipc.len());
+    push_str(&mut bytes, &record.table);
+    bytes.extend_from_slice(&ipc);
+    Ok(bytes)
+}
+
+/// Reads a schema record back, or `None` if the bytes are not one.
+fn decode_schema(bytes: &[u8]) -> Option<SchemaRecord> {
+    let mut cursor = Cursor { bytes, at: 0 };
+    let table = cursor.take_str()?;
+    let ipc = bytes.get(cursor.at..)?;
+
+    Some(SchemaRecord {
+        table,
+        schema: Arc::new(try_schema_from_ipc_buffer(ipc).ok()?),
+    })
 }
 
 /// Encodes a registration into the log's payload form.
@@ -215,6 +296,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+
     use crate::registry::{MetricRegistry, Registration, SeriesKey};
     use crate::seq::AtomicSequence;
     use crate::storage::{Fault, InMemoryStorage};
@@ -237,8 +320,8 @@ mod tests {
         )
     }
 
-    /// A registry backed by a real log over `storage`.
-    fn logged_registry(storage: &InMemoryStorage) -> MetricRegistry {
+    /// A catalogue log over `storage`.
+    fn catalog_log(storage: &InMemoryStorage) -> Arc<WalCatalogLog> {
         let wal = Arc::new(
             Wal::open(
                 Arc::new(storage.clone()),
@@ -247,14 +330,19 @@ mod tests {
             )
             .unwrap(),
         );
-        MetricRegistry::new(Arc::new(WalRegistrationLog::new(
+        Arc::new(WalCatalogLog::new(
             wal,
             Arc::new(AtomicSequence::starting_at(0)),
-        )))
+        ))
     }
 
-    fn recover(storage: &InMemoryStorage) -> RecoveredRegistrations {
-        replay_registrations(storage, &PathBuf::from(CATALOG_LOG_DIR)).unwrap()
+    /// A registry backed by a real catalogue log over `storage`.
+    fn logged_registry(storage: &InMemoryStorage) -> MetricRegistry {
+        MetricRegistry::new(catalog_log(storage))
+    }
+
+    fn recover(storage: &InMemoryStorage) -> RecoveredCatalog {
+        replay_catalog(storage, &PathBuf::from(CATALOG_LOG_DIR)).unwrap()
     }
 
     #[test]
@@ -432,6 +520,172 @@ mod tests {
             seqs.windows(2).all(|pair| pair[1] > pair[0]),
             "sequence numbers must increase: {seqs:?}"
         );
+    }
+
+    // ---- schema records (§6) ----
+
+    fn table_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("metric_id", DataType::UInt64, false),
+            Field::new("value", DataType::Float64, true),
+        ]))
+    }
+
+    /// §6: the schema is state and has to survive a restart, or the type-change
+    /// rejection stops working — a client sending a different type would be
+    /// admitted and the conflict would surface later as unreadable Parquet.
+    #[test]
+    fn a_schema_round_trips_through_the_log() {
+        let storage = InMemoryStorage::new();
+        let log = catalog_log(&storage);
+        let recorded = SchemaRecord {
+            table: "readings".to_owned(),
+            schema: table_schema(),
+        };
+        log.append_schema(&recorded).unwrap();
+
+        let recovered = recover(&storage);
+
+        assert_eq!(recovered.schemas, vec![recorded]);
+        assert_eq!(recovered.undecodable, 0);
+    }
+
+    /// The encoding has to be faithful for every type a payload column may hold,
+    /// not just for the three in the sample table.
+    #[test]
+    fn a_schema_of_many_types_round_trips() {
+        let wide = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, true),
+            Field::new("b", DataType::Int8, false),
+            Field::new("c", DataType::UInt64, true),
+            Field::new("d", DataType::Float32, true),
+            Field::new("e", DataType::Utf8, true),
+            Field::new("f", DataType::Binary, true),
+            Field::new("g", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("h", DataType::Decimal128(20, 4), true),
+            Field::new(
+                "i",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true,
+            ),
+        ]));
+
+        let encoded = encode_schema(&SchemaRecord {
+            table: "wide".to_owned(),
+            schema: Arc::clone(&wide),
+        })
+        .unwrap();
+
+        let decoded = decode_schema(&encoded).expect("decodes");
+        assert_eq!(decoded.schema, wide, "a field lost its type or nullability");
+        assert_eq!(decoded.table, "wide");
+    }
+
+    /// §4: registrations and schemas share one log, so a replay has to separate
+    /// them again without losing either.
+    #[test]
+    fn registrations_and_schemas_share_one_log_and_separate_on_replay() {
+        let storage = InMemoryStorage::new();
+        let registry = logged_registry(&storage);
+        let log = catalog_log(&storage);
+
+        registry.register(key("temp", &[])).unwrap();
+        log.append_schema(&SchemaRecord {
+            table: "readings".to_owned(),
+            schema: table_schema(),
+        })
+        .unwrap();
+        registry.register(key("flow", &[])).unwrap();
+
+        let recovered = recover(&storage);
+
+        assert_eq!(recovered.registrations.len(), 2);
+        assert_eq!(recovered.schemas.len(), 1);
+        assert_eq!(recovered.undecodable, 0);
+    }
+
+    /// §6: evolution appends. The newest record for a table is the current
+    /// schema, and the earlier ones are history rather than a conflict.
+    #[test]
+    fn an_evolved_schema_appends_rather_than_replacing() {
+        let storage = InMemoryStorage::new();
+        let log = catalog_log(&storage);
+
+        let mut evolved = table_schema().fields().to_vec();
+        evolved.push(Arc::new(Field::new("quality", DataType::Int32, true)));
+        let evolved = Arc::new(Schema::new(evolved));
+
+        for schema in [table_schema(), Arc::clone(&evolved)] {
+            log.append_schema(&SchemaRecord {
+                table: "readings".to_owned(),
+                schema,
+            })
+            .unwrap();
+        }
+
+        let recovered = recover(&storage);
+        assert_eq!(recovered.schemas.len(), 2, "both records must be kept");
+        assert_eq!(
+            recovered.schemas.last().map(|record| &record.schema),
+            Some(&evolved),
+            "the last record must be the current schema"
+        );
+    }
+
+    /// §4, §6: the same guarantee the registrations have. Reclaiming the data log
+    /// must not take a schema with it.
+    #[test]
+    fn schemas_survive_reclaiming_the_whole_data_log() {
+        let storage = InMemoryStorage::new();
+        catalog_log(&storage)
+            .append_schema(&SchemaRecord {
+                table: "readings".to_owned(),
+                schema: table_schema(),
+            })
+            .unwrap();
+
+        let mut data = WalWriter::open(
+            Arc::new(storage.clone()),
+            PathBuf::from(DATA_LOG_DIR),
+            WalConfig {
+                segment_bytes: 48,
+                max_commit_delay: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        for seq in 0..20 {
+            data.write_all(&[crate::wal::WalRecord {
+                kind: RecordKind::Data,
+                seq,
+                payload: vec![b'x'; 24],
+            }])
+            .unwrap();
+        }
+        assert!(data.reclaim(u64::MAX).unwrap() > 0);
+
+        assert_eq!(recover(&storage).schemas.len(), 1);
+    }
+
+    #[test]
+    fn a_schema_payload_that_is_not_one_is_counted_and_skipped() {
+        let storage = InMemoryStorage::new();
+        let wal = Wal::open(
+            Arc::new(storage.clone()),
+            PathBuf::from(CATALOG_LOG_DIR),
+            config(),
+        )
+        .unwrap();
+        wal.append(RecordKind::Schema, 0, b"not a schema".to_vec())
+            .unwrap();
+
+        let recovered = recover(&storage);
+        assert_eq!(recovered.undecodable, 1);
+        assert!(recovered.schemas.is_empty());
     }
 
     /// A record whose payload survived the CRC but cannot be decoded must not

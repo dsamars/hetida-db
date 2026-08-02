@@ -39,6 +39,7 @@ fn any_record() -> impl Strategy<Value = WalRecord> {
             Just(RecordKind::Data),
             Just(RecordKind::Registration),
             Just(RecordKind::Checkpoint),
+            Just(RecordKind::Schema),
         ],
         any::<Seq>(),
         prop::collection::vec(any::<u8>(), 0..48),
