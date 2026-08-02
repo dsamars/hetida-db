@@ -1748,6 +1748,43 @@ mod tests {
         );
     }
 
+    /// §10, §9: the registry catalog tables are tables. A principal nobody
+    /// granted them may not read the archive's series names and label values
+    /// merely because they are metadata.
+    #[tokio::test]
+    async fn the_registry_catalog_needs_a_grant_of_its_own() {
+        use crate::query::SERIES_TABLE;
+
+        let mut client = serve_with_auth(credentials()).await;
+        let reader = handshake(&mut client, "reader", "hunter2").await.unwrap();
+
+        assert_eq!(
+            read_as(
+                &mut client,
+                &format!("SELECT * FROM {SERIES_TABLE}"),
+                Some(&reader)
+            )
+            .await
+            .expect_err("must be refused")
+            .code(),
+            tonic::Code::PermissionDenied,
+            "a grant nobody wrote down is not a grant, metadata included"
+        );
+
+        // A principal granted everything reads it, so this is a grant and not
+        // a blanket refusal.
+        let writer = handshake(&mut client, "writer", "s3cret").await.unwrap();
+        assert!(
+            read_as(
+                &mut client,
+                &format!("SELECT * FROM {SERIES_TABLE}"),
+                Some(&writer)
+            )
+            .await
+            .is_ok()
+        );
+    }
+
     /// §9: describing data needs the same grant as reading it, or a schema
     /// would leak a table's shape to a client that may not see its rows.
     #[tokio::test]
