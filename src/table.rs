@@ -39,6 +39,7 @@ use crate::clock::Micros;
 use crate::memtable::{InsertOutcome, MemTable, MemTableError};
 use crate::partition::{PartitionError, PartitionInterval};
 use crate::schema::TIMESTAMP_COLUMN;
+use crate::seq::Seq;
 use crate::suppression::{SuppressionConfig, SuppressionIndex};
 
 /// Why an insert into a partitioned table failed.
@@ -152,6 +153,14 @@ impl PartitionedTable {
             .iter()
             .map(|entry| entry.value().current().memory_bytes())
             .sum()
+    }
+
+    /// The lowest `seq` any partition still holds (§4).
+    pub fn min_seq(&self) -> Option<Seq> {
+        self.partitions
+            .iter()
+            .filter_map(|entry| entry.value().current().min_seq())
+            .min()
     }
 
     /// Rows currently held across every partition, counting every version.

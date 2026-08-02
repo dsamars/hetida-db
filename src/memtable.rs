@@ -363,6 +363,17 @@ impl MemTable {
         all
     }
 
+    /// The lowest `seq` this table holds, if any.
+    ///
+    /// The flusher needs it to decide how far a checkpoint may reach: a segment
+    /// may only be reclaimed once nothing below it is still in memory (§4).
+    pub fn min_seq(&self) -> Option<Seq> {
+        self.index
+            .iter()
+            .filter_map(|entry| entry.value().first().map(|version| version.seq))
+            .min()
+    }
+
     /// Every version in one batch, ordered by `(metric_id, timestamp, seq)`.
     ///
     /// This is the flush path, the one place re-batching is permitted: the

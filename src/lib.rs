@@ -25,7 +25,7 @@
 //! batch in it ([`table`]), the startup sequence that assembles all of it
 //! ([`archive`]) and the Flight surface serving it ([`flight`]), with batches
 //! made durable through the data log ([`data_log`]) and archived as Parquet
-//! ([`parquet`]).
+//! ([`parquet`]) by the flusher ([`flush`]).
 
 #![warn(missing_docs)]
 // The zero-panic policy, enforced mechanically. `panic`, `unreachable` and
@@ -47,6 +47,7 @@ pub mod catalog_log;
 pub mod clock;
 pub mod data_log;
 pub mod flight;
+pub mod flush;
 pub mod instance;
 pub mod memtable;
 pub mod parquet;

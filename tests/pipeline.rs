@@ -21,6 +21,7 @@ use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray, UInt64A
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use hetida_db::active::ActiveMemTable;
+use hetida_db::archive::{Archive, ArchiveConfig};
 use hetida_db::catalog::{TableCatalogue, TableConfig};
 use hetida_db::catalog_log::{CATALOG_LOG_DIR, WalCatalogLog, replay_catalog};
 use hetida_db::clock::{Micros, TestClock};
@@ -474,5 +475,84 @@ fn the_control_plane_messages_round_trip() {
     assert_eq!(
         Query::decode(query.encode_to_vec().as_slice()).unwrap(),
         query
+    );
+}
+
+/// §1, §2, §4: the whole write path, ending where Phase 1 could not. A batch is
+/// ingested, the partition is flushed to Parquet, and the checkpoint that makes
+/// the WAL reclaimable is derived safely — never from the file's own `seq`.
+#[test]
+fn ingested_rows_reach_parquet_and_make_the_log_reclaimable() {
+    use hetida_db::flush::{FlushConfig, Flusher, flush_reason};
+    use hetida_db::parquet::{ParquetConfig, read_partition};
+
+    let storage = InMemoryStorage::new();
+    let config = ArchiveConfig {
+        wal: wal_config(),
+        ..ArchiveConfig::default()
+    };
+    let archive = Archive::open(
+        Arc::new(storage.clone()),
+        &config,
+        Arc::new(TestClock::new(AUGUST)),
+    )
+    .expect("archive");
+
+    // Two partitions, September written after August so the trap is live: the
+    // September file holds the higher seq while August is still in memory.
+    archive
+        .ingest("readings", &client_batch(&[(1, AUGUST, 1.5)]))
+        .expect("august");
+    archive
+        .ingest("readings", &client_batch(&[(1, SEPTEMBER, 2.5)]))
+        .expect("september");
+
+    let state = archive.table("readings").expect("readings");
+    let flusher = Flusher::new(
+        Arc::new(storage.clone()),
+        "readings",
+        archive.interval(),
+        ParquetConfig::default(),
+    );
+
+    let september_start = archive.interval().start(SEPTEMBER).unwrap();
+    let file = flusher
+        .flush(&state, september_start)
+        .expect("flush")
+        .expect("a file");
+
+    // The rows are in Parquet, all of them.
+    let read = read_partition(&storage, &file.path).expect("read back");
+    assert_eq!(read.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    // §4: August's seq is lower and still in memory, so the checkpoint may not
+    // reach the September file's maximum.
+    let watermark = Flusher::checkpoint_watermark(&state, Some(file.max_seq));
+    assert!(
+        watermark.is_none_or(|mark| mark < file.max_seq),
+        "the checkpoint reached a seq that is still only in memory"
+    );
+
+    // Once August is flushed too, nothing is left and the whole range is
+    // checkpointable.
+    let august_start = archive.interval().start(AUGUST).unwrap();
+    flusher.flush(&state, august_start).expect("flush august");
+    assert_eq!(state.num_rows(), 0);
+    let watermark = Flusher::checkpoint_watermark(&state, Some(file.max_seq))
+        .expect("everything is in Parquet now");
+    archive
+        .data_log()
+        .checkpoint(watermark)
+        .expect("checkpoint");
+
+    // And the trigger agrees the partitions are done: nothing is held.
+    assert_eq!(
+        flush_reason(
+            FlushConfig::default(),
+            state.memory_bytes(),
+            Some(AUGUST),
+            AUGUST
+        ),
+        None
     );
 }
