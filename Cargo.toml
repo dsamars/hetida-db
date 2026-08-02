@@ -13,18 +13,34 @@ license = "MIT"
 readme = "README.md"
 
 [dependencies]
+# Startup and CLI errors, where a chain of context beats a typed enum.
+# Library and domain logic uses thiserror instead.
+anyhow = "1"
 arc-swap = "1.9.2"
 # Arrow is pinned to the version DataFusion resolves to, not to the latest
 # release: arrow, parquet, arrow-flight and datafusion must share one Arrow
 # major or their types conflict across crate boundaries. datafusion 54.1
 # resolves arrow 58.4, so Phase 3 must add datafusion 54.x, not a newer line.
 arrow = "58.4"
+# The wire protocol (§5). Same Arrow version as above, by the rule in that
+# comment: it exchanges Arrow types across the crate boundary.
+arrow-flight = "58.4"
 # Calendar arithmetic for the Hive-style partition layout (§11). Pinned to the
 # version arrow already resolves, so only one chrono is in the graph.
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 crc32fast = "1.5.0"
 dashmap = "6.2.1"
+# Stream combinators for the do_put/do_get streams; arrow-flight speaks in
+# `futures::Stream`, so this is its vocabulary rather than an extra choice.
+futures = "0.3"
 thiserror = "2"
+# Async runtime. Features kept to what the server needs: a multi-threaded
+# runtime, the test/main macros, TCP, and signal handling for shutdown.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+# gRPC transport under Arrow Flight. Pinned to the line arrow-flight 58.4
+# resolves (0.14): a different major would make its Flight service traits
+# incompatible with ours.
+tonic = "0.14"
 # Payload digests for §1 unchanged-value suppression. Non-cryptographic is
 # sufficient: the comparison is not adversarial — a client constructing a
 # collision would only discard its own correction, which it could equally
@@ -34,3 +50,4 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+tokio-stream = "0.1"
