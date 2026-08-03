@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Heiko Dietz
 
-//! Instance metadata and the startup layout check (§11).
+//! Instance metadata, the startup layout check (§11) and the on-disk format
+//! gate (§12).
 //!
 //! The partition interval is fixed when an instance is initialised and recorded
 //! on disk. Every later start validates the configured interval against that
@@ -23,6 +24,17 @@
 //! build may add fields without an older one refusing to start; a missing or
 //! unparsable `partition_interval` is [`InstanceError::Corrupt`], never a
 //! fallback to the default.
+//!
+//! [`FORMAT_VERSION`] is resolved before any of that, and before either log is
+//! replayed (§12) — this is the archive-wide gate, and it is checked at the only
+//! moment where refusing is still clean. A stamp higher than this build reads is
+//! [`InstanceError::UnknownFormatVersion`], never an attempt; no stamp at all is
+//! [`InstanceError::PredatesVersioning`], never an assumption that it means
+//! version 1. Note the asymmetry the tolerance above creates: a build older than
+//! §12 ignores the version field like any other unknown key, so it cannot be
+//! stopped from opening a future archive. That is the cost of not having had a
+//! version from the first commit, and it is why this landed before 0.1.0 rather
+//! than after.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -38,6 +50,18 @@ pub const DATA_DIR: &str = "data";
 
 /// Key recording the partition interval (§11).
 const PARTITION_INTERVAL_KEY: &str = "partition_interval";
+
+/// Key recording the on-disk format version (§12).
+const FORMAT_VERSION_KEY: &str = "format_version";
+
+/// The on-disk format this build writes and is the newest it can read (§12).
+///
+/// One number covers the whole archive — the logs, the Parquet files and this
+/// metadata — and is bumped whenever any of them changes shape. Reading an
+/// archive stamped higher than this is refused rather than attempted, because a
+/// wrong guess about what bytes mean is not detectable, only its consequences
+/// are.
+pub const FORMAT_VERSION: u32 = 1;
 
 /// Why an instance could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +86,27 @@ pub enum InstanceError {
          letting a second layout be written"
     )]
     UnknownLayout,
+    /// The archive was written by a build with a newer on-disk format (§12).
+    #[error(
+        "`{METADATA_PATH}` records on-disk format version {found}, \
+         but this build reads at most {supported}; \
+         run a build that understands version {found} rather than \
+         downgrading, which would misread the archive"
+    )]
+    UnknownFormatVersion {
+        /// What the archive is stamped with.
+        found: u32,
+        /// The newest this build can read.
+        supported: u32,
+    },
+    /// The metadata records no format version at all (§12).
+    #[error(
+        "`{METADATA_PATH}` records no `{FORMAT_VERSION_KEY}`: it was written \
+         either before format versioning existed or by a torn write. \
+         There is nothing to repair — re-create the archive; \
+         releases before 0.1.0 carry no migration path"
+    )]
+    PredatesVersioning,
     /// The metadata exists but could not be understood.
     #[error("`{METADATA_PATH}` is not readable instance metadata: {reason}")]
     Corrupt {
@@ -77,6 +122,14 @@ pub enum InstanceError {
 #[derive(Debug)]
 pub struct InstanceMetadata {
     partition_interval: PartitionInterval,
+    format_version: u32,
+}
+
+/// What one metadata file records.
+#[derive(Debug, Clone, Copy)]
+struct Recorded {
+    partition_interval: PartitionInterval,
+    format_version: u32,
 }
 
 impl InstanceMetadata {
@@ -89,11 +142,12 @@ impl InstanceMetadata {
         configured: PartitionInterval,
     ) -> Result<Self, InstanceError> {
         match read_recorded(storage.as_ref())? {
-            Some(recorded) if recorded == configured => Ok(Self {
-                partition_interval: recorded,
+            Some(recorded) if recorded.partition_interval == configured => Ok(Self {
+                partition_interval: recorded.partition_interval,
+                format_version: recorded.format_version,
             }),
             Some(recorded) => Err(InstanceError::IntervalMismatch {
-                recorded,
+                recorded: recorded.partition_interval,
                 configured,
             }),
             None if has_partitions(storage.as_ref())? => Err(InstanceError::UnknownLayout),
@@ -101,6 +155,7 @@ impl InstanceMetadata {
                 write_recorded(storage.as_ref(), configured)?;
                 Ok(Self {
                     partition_interval: configured,
+                    format_version: FORMAT_VERSION,
                 })
             }
         }
@@ -110,10 +165,20 @@ impl InstanceMetadata {
     pub fn partition_interval(&self) -> PartitionInterval {
         self.partition_interval
     }
+
+    /// The on-disk format version this archive is stamped with (§12).
+    ///
+    /// Never greater than [`FORMAT_VERSION`]: a higher one refuses to open.
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
 }
 
-/// Reads the recorded interval, or `None` if the instance is uninitialised.
-fn read_recorded(storage: &dyn Storage) -> Result<Option<PartitionInterval>, InstanceError> {
+/// Reads what the metadata records, or `None` if the instance is uninitialised.
+///
+/// The format version is resolved before anything else (§12): a build that
+/// cannot read the format can conclude nothing about what the other fields mean.
+fn read_recorded(storage: &dyn Storage) -> Result<Option<Recorded>, InstanceError> {
     let path = Path::new(METADATA_PATH);
     // An absent file is an uninitialised instance; any other failure is real.
     let bytes = match storage.read(path) {
@@ -126,27 +191,53 @@ fn read_recorded(storage: &dyn Storage) -> Result<Option<PartitionInterval>, Ins
         reason: format!("not UTF-8: {error}"),
     })?;
 
-    let recorded = text
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == PARTITION_INTERVAL_KEY)
-        .map(|(_, value)| value.trim())
+    let value_of = |wanted: &str| {
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .find(|(key, _)| key.trim() == wanted)
+            .map(|(_, value)| value.trim().to_owned())
+    };
+
+    // §12: the gate. Absent means the archive predates versioning, which is not
+    // the same as a version that fails to parse — that is damage.
+    let format_version: u32 = value_of(FORMAT_VERSION_KEY)
+        .ok_or(InstanceError::PredatesVersioning)?
+        .parse()
+        .map_err(|error| InstanceError::Corrupt {
+            reason: format!("`{FORMAT_VERSION_KEY}` is not a version number: {error}"),
+        })?;
+    if format_version > FORMAT_VERSION {
+        return Err(InstanceError::UnknownFormatVersion {
+            found: format_version,
+            supported: FORMAT_VERSION,
+        });
+    }
+
+    let partition_interval = value_of(PARTITION_INTERVAL_KEY)
         .ok_or_else(|| InstanceError::Corrupt {
             reason: format!("no `{PARTITION_INTERVAL_KEY}` entry"),
-        })?;
-
-    recorded
+        })?
         .parse()
-        .map(Some)
         .map_err(|error| InstanceError::Corrupt {
             reason: format!("{error}"),
-        })
+        })?;
+
+    Ok(Some(Recorded {
+        partition_interval,
+        format_version,
+    }))
 }
 
-/// Records `interval` durably, so the next start can validate against it.
+/// Records the format version and `interval` durably, so the next start can
+/// validate against both.
 fn write_recorded(storage: &dyn Storage, interval: PartitionInterval) -> Result<(), InstanceError> {
     let mut file = storage.open_append(Path::new(METADATA_PATH))?;
-    file.append(format!("{PARTITION_INTERVAL_KEY}={interval}\n").as_bytes())?;
+    // The version leads, so a write torn partway through loses the interval
+    // rather than the field that says how to read it (§12).
+    file.append(
+        format!("{FORMAT_VERSION_KEY}={FORMAT_VERSION}\n{PARTITION_INTERVAL_KEY}={interval}\n")
+            .as_bytes(),
+    )?;
     // Synced before anything writes a partition, so a layout never exists on
     // disk without the record that explains it.
     file.sync()?;
@@ -284,7 +375,11 @@ mod tests {
     #[test]
     fn unreadable_metadata_is_reported_rather_than_ignored() {
         let storage = InMemoryStorage::new();
-        write(&storage, METADATA_PATH, "partition_interval=fortnight\n");
+        write(
+            &storage,
+            METADATA_PATH,
+            &format!("{FORMAT_VERSION_KEY}={FORMAT_VERSION}\npartition_interval=fortnight\n"),
+        );
 
         assert!(matches!(
             open(&storage, PartitionInterval::Month),
@@ -295,7 +390,11 @@ mod tests {
     #[test]
     fn metadata_without_the_interval_is_corrupt() {
         let storage = InMemoryStorage::new();
-        write(&storage, METADATA_PATH, "something_else=month\n");
+        write(
+            &storage,
+            METADATA_PATH,
+            &format!("{FORMAT_VERSION_KEY}={FORMAT_VERSION}\nsomething_else=month\n"),
+        );
 
         assert!(matches!(
             open(&storage, PartitionInterval::Month),
@@ -304,14 +403,18 @@ mod tests {
     }
 
     /// Unknown keys are tolerated, so a newer build may add fields without the
-    /// older one refusing to start on them.
+    /// older one refusing to start on them. Note the asymmetry §12 records: this
+    /// tolerance is exactly why a build older than §12 cannot be protected from
+    /// a future format — it would ignore the version field too.
     #[test]
     fn unknown_keys_are_tolerated() {
         let storage = InMemoryStorage::new();
         write(
             &storage,
             METADATA_PATH,
-            "partition_interval=day\nsomething_new=7\n",
+            &format!(
+                "{FORMAT_VERSION_KEY}={FORMAT_VERSION}\npartition_interval=day\nsomething_new=7\n"
+            ),
         );
 
         assert_eq!(
@@ -343,11 +446,125 @@ mod tests {
 
         // Whatever landed, a later start either reads it back correctly or
         // refuses — it must never silently adopt a different interval.
+        //
+        // A torn write can also cut the version line itself, which is
+        // indistinguishable from metadata written before §12 existed. Both are
+        // `PredatesVersioning`, and both mean the same thing to an operator:
+        // there is nothing here to repair.
         match open(&storage, PartitionInterval::Month) {
             Ok(metadata) => {
                 assert_eq!(metadata.partition_interval(), PartitionInterval::Month)
             }
-            Err(error) => assert!(matches!(error, InstanceError::Corrupt { .. })),
+            Err(error) => assert!(
+                matches!(
+                    error,
+                    InstanceError::Corrupt { .. } | InstanceError::PredatesVersioning
+                ),
+                "unexpected error: {error}"
+            ),
         }
+    }
+
+    /// §12: the version is recorded when the instance is initialised, on disk
+    /// rather than only in memory — it has to survive the process that wrote it.
+    #[test]
+    fn a_fresh_instance_records_the_format_version() {
+        let storage = InMemoryStorage::new();
+        let metadata = open(&storage, PartitionInterval::Month).unwrap();
+
+        assert_eq!(metadata.format_version(), FORMAT_VERSION);
+
+        let written = String::from_utf8(storage.read(Path::new(METADATA_PATH)).unwrap()).unwrap();
+        assert!(
+            written.contains(&format!("{FORMAT_VERSION_KEY}={FORMAT_VERSION}")),
+            "the version must be in the file: {written}"
+        );
+    }
+
+    /// §12: this is the decision. A version the build does not know is refused
+    /// by name — never adapted to, never guessed at.
+    #[test]
+    fn a_newer_format_version_refuses_to_start() {
+        let storage = InMemoryStorage::new();
+        let future = FORMAT_VERSION + 1;
+        write(
+            &storage,
+            METADATA_PATH,
+            &format!("partition_interval=month\n{FORMAT_VERSION_KEY}={future}\n"),
+        );
+
+        let error = open(&storage, PartitionInterval::Month).expect_err("must refuse");
+
+        assert!(
+            matches!(
+                error,
+                InstanceError::UnknownFormatVersion { found, supported }
+                    if found == future && supported == FORMAT_VERSION
+            ),
+            "unexpected error: {error}"
+        );
+        // Both numbers, or an operator cannot tell which build to run.
+        let message = error.to_string();
+        assert!(
+            message.contains(&future.to_string()) && message.contains(&FORMAT_VERSION.to_string()),
+            "{message}"
+        );
+    }
+
+    /// §12: an archive from before versioning existed is refused rather than
+    /// assumed to be version 1. Assuming would be a compatibility claim owed
+    /// forever, for archives only `0.1.0-alpha.1` could have written.
+    #[test]
+    fn metadata_predating_versioning_refuses_to_start() {
+        let storage = InMemoryStorage::new();
+        write(&storage, METADATA_PATH, "partition_interval=month\n");
+
+        let error = open(&storage, PartitionInterval::Month).expect_err("must refuse");
+
+        assert!(
+            matches!(error, InstanceError::PredatesVersioning),
+            "unexpected error: {error}"
+        );
+        // It has to say what to do, because there is nothing to repair.
+        assert!(error.to_string().contains("re-create"), "{error}");
+    }
+
+    /// A version that is present but not a number is damage, not a version from
+    /// the future — the two must not be reported as the same thing.
+    #[test]
+    fn an_unparsable_format_version_is_corrupt() {
+        let storage = InMemoryStorage::new();
+        write(
+            &storage,
+            METADATA_PATH,
+            &format!("partition_interval=month\n{FORMAT_VERSION_KEY}=tuesday\n"),
+        );
+
+        assert!(matches!(
+            open(&storage, PartitionInterval::Month),
+            Err(InstanceError::Corrupt { .. })
+        ));
+    }
+
+    /// The version is checked before the interval: a build that cannot read the
+    /// format cannot conclude anything about what the interval means.
+    #[test]
+    fn an_unknown_version_is_reported_ahead_of_an_interval_mismatch() {
+        let storage = InMemoryStorage::new();
+        write(
+            &storage,
+            METADATA_PATH,
+            &format!(
+                "partition_interval=month\n{FORMAT_VERSION_KEY}={}\n",
+                FORMAT_VERSION + 1
+            ),
+        );
+
+        let error = open(&storage, PartitionInterval::Day).expect_err("must refuse");
+
+        assert!(
+            matches!(error, InstanceError::UnknownFormatVersion { .. }),
+            "unexpected error: {error}"
+        );
     }
 }
