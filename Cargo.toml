@@ -5,7 +5,7 @@
 
 [package]
 name = "hetida-db"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 authors = ["Heiko Dietz <hdietz@outlook.com>"]
 description = "High-performance time-series archiver built on Apache Arrow Flight, Parquet and DataFusion"

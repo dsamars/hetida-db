@@ -87,10 +87,20 @@ The observation point travels in the `Ticket` beside the SQL as `hetida.v1.Query
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — system design and the settled design decisions
 - [`CLAUDE.md`](CLAUDE.md) — performance, quality and documentation rules for contributors
 - [`tasks.md`](tasks.md) — phased implementation plan
+- [`CHANGELOG.md`](CHANGELOG.md) — what each release contains, and what it does not
 
 ## Status
 
-All four phases in [`tasks.md`](tasks.md) are complete: the write path, Parquet archival with compaction and retention, the query engine with as-of resolution, TLS and per-table authorization, and the Phase 4 benchmarks and verification suite.
+**Alpha — `0.1.0-alpha.1`.** All four phases in [`tasks.md`](tasks.md) are
+complete: the write path, Parquet archival with compaction and retention, the
+query engine with as-of resolution, TLS and per-table authorization, and the
+Phase 4 benchmarks and verification suite. 507 tests pass.
+
+Nothing is stable yet. The on-disk layout, the configuration file and the Flight
+contract may each change without a migration path before 0.1.0, and there are no
+query cost limits — so do not expose it to clients you would not also give a
+shell. [`CHANGELOG.md`](CHANGELOG.md) lists what the release contains and what it
+does not.
 
 Development is strictly test-driven, and `cargo test` and `cargo clippy -- -D warnings` must pass before any task is complete. TLS is covered end to end against a certificate generated for the run, so nothing about the secure path rests on inspection alone.
 
