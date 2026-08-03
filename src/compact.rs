@@ -35,8 +35,10 @@
 //! recoverable; absence is not.
 //!
 //! The store offers no rename, so an output that re-emits an input's `max_seq`
-//! would collide with it. Outputs carry a discriminator in their name instead —
-//! see [`crate::parquet::file_name`].
+//! would collide with it. Outputs are named one generation above their inputs
+//! instead — see [`crate::parquet::Output`]. The generation is what makes a
+//! second pass over an unchanged partition safe: without it that pass
+//! reproduces its inputs' names exactly and deletes what it just wrote.
 
 use std::sync::Arc;
 
@@ -45,7 +47,9 @@ use arrow::compute::{SortColumn, concat_batches, lexsort_to_indices, take_record
 
 use crate::clock::Micros;
 use crate::instance::DATA_DIR;
-use crate::parquet::{ParquetConfig, WriteError, WrittenFile, read_partition, write_named};
+use crate::parquet::{
+    Output, ParquetConfig, WriteError, WrittenFile, generation_of, read_partition, write_named,
+};
 use crate::partition::PartitionInterval;
 use crate::registry::MetricId;
 use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN};
@@ -67,6 +71,16 @@ pub enum CompactError {
     /// A key column was missing or had an unexpected type.
     #[error("column `{0}` is missing or not the expected type")]
     KeyColumn(String),
+    /// An output took the name of a file this pass is about to remove (§3).
+    ///
+    /// The generation in the name makes this unreachable. It is still checked,
+    /// and checked before anything is removed, because the cost of the naming
+    /// rule being wrong is every row in the partition.
+    #[error(
+        "output `{0}` has the name of one of its own inputs; \
+         removing the inputs would delete it (§1, §3)"
+    )]
+    OutputCollidesWithInput(std::path::PathBuf),
 }
 
 /// When a partition is compacted, and into what (§3).
@@ -213,6 +227,17 @@ impl Compactor {
         let rows_in = merged.num_rows();
         let sorted = sort_by_key(&merged)?;
 
+        // One past the highest generation among the inputs, so no output can be
+        // named after a file this pass removes — see [`Output`]. Deriving it
+        // from the inputs rather than counting passes keeps it correct after a
+        // restart, which has no memory of how often this partition was merged.
+        let generation = inputs
+            .iter()
+            .map(|input| generation_of(input))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+
         // Written and synced before anything is removed.
         let mut written = Vec::new();
         for (index, slice) in self
@@ -225,12 +250,20 @@ impl Compactor {
                 directory,
                 &slice,
                 self.parquet,
-                Some(index as u32),
+                Some(Output::new(generation, index as u32)),
             )?);
         }
 
         let rows_out: usize = written.iter().map(|file| file.rows).sum();
         debug_assert_eq!(rows_in, rows_out, "compaction changed the row count");
+
+        // Before the first removal, not during: a pass that would delete its own
+        // output must leave the partition exactly as it found it.
+        for file in &written {
+            if inputs.contains(&file.path) {
+                return Err(CompactError::OutputCollidesWithInput(file.path.clone()));
+            }
+        }
 
         let mut removed = Vec::new();
         for input in inputs {
@@ -463,6 +496,18 @@ mod tests {
         }
     }
 
+    /// Eager, and small enough a target that the output is cut into one file per
+    /// key. A partition large enough to slice is the case a single-output
+    /// compaction never reaches: it stays above `max_files` afterwards, so it
+    /// comes round again with its inputs unchanged.
+    fn slicing() -> CompactConfig {
+        CompactConfig {
+            max_files: 2,
+            max_bytes: usize::MAX,
+            target_bytes: 1,
+        }
+    }
+
     fn all_keys(storage: &InMemoryStorage) -> Vec<(MetricId, Micros, Seq)> {
         let mut keys = Vec::new();
         for file in storage.list(&dir()).unwrap() {
@@ -679,6 +724,69 @@ mod tests {
                 .iter()
                 .all(|file| !result.removed.contains(&file.path)),
             "an output took an input's name"
+        );
+    }
+
+    /// §1: a second pass over a partition nothing has written to since must not
+    /// lose a row.
+    ///
+    /// [`compaction_is_idempotent_in_content`] means to cover this and cannot:
+    /// its rows fit in one output file, and one file is never due, so its second
+    /// and third passes do nothing at all. The case only exists once compaction
+    /// emits several files — then the partition is still over `max_files`
+    /// afterwards and comes round again with its inputs unchanged.
+    #[test]
+    fn recompacting_a_sliced_partition_keeps_every_row() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
+        let before = all_keys(&storage);
+
+        let first = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap()
+            .expect("a three-file partition is due");
+        // Without this the test passes for the wrong reason, which is exactly
+        // how the idempotence test above came to be green.
+        assert!(
+            first.written.len() >= 2,
+            "the setup must leave the partition due again, got {} output(s)",
+            first.written.len()
+        );
+
+        let second = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        assert!(
+            second.is_some(),
+            "an unchanged partition of several files is due again"
+        );
+
+        assert_eq!(all_keys(&storage), before, "the second pass lost rows");
+    }
+
+    /// §3: an output may never take the name of a file the same pass removes.
+    ///
+    /// [`an_output_never_collides_with_an_input_name`] asserts this over inputs
+    /// a flush wrote, which use a name without a discriminator and so cannot
+    /// collide. When the inputs are themselves compaction outputs, an unchanged
+    /// input set yields the same slices, the same `max_seq` and the same indices
+    /// — and therefore the very names being deleted.
+    #[test]
+    fn an_output_never_takes_the_name_of_an_input_it_replaces() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
+        compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+
+        let second = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap()
+            .expect("still due");
+
+        let clobbered: Vec<_> = second
+            .written
+            .iter()
+            .filter(|file| second.removed.contains(&file.path))
+            .map(|file| file.path.clone())
+            .collect();
+        assert!(
+            clobbered.is_empty(),
+            "outputs deleted as inputs of the same pass: {clobbered:?}"
         );
     }
 

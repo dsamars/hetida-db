@@ -64,6 +64,31 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ### Fixed
 
+- **Compacting a partition twice deleted every row in it.** A compaction output
+  was named `part-<seq>-c<index>.parquet`. Running again over an *unchanged* set
+  of inputs reproduces the same slices, so the same `max_seq` and the same
+  indices — the outputs took the names of the very files the pass then removed,
+  and the partition was left empty. It was reported as a successful compaction
+  with a correct row count, and no warning.
+
+  A partition reaches that state on its own: compaction emits several files for
+  a large partition, which leaves the file count above `max_files`, so it comes
+  round again with nothing changed. Loading a 224.5 M-row archive lost 5 of 673
+  partitions this way — 18.5 M rows in the first two alone. This contradicts §1
+  outright, which permits no path that drops a version except retention.
+
+  Outputs are now named one **generation** above their inputs
+  (`part-<seq>-g<generation>-c<index>.parquet`), which makes the collision
+  arithmetically impossible; the generation is derived from the input names, so
+  it survives a restart. Compaction additionally refuses, before removing
+  anything, if an output ever carries an input's name.
+
+  Files written before this change read as generation 0 and are compacted
+  safely — the new names cannot collide with the old shape. **Rows already lost
+  are not recoverable**, and an archive whose logs show a partition compacted
+  twice with an identical file and row count should be checked for empty
+  partitions.
+
 - **Two writers meeting on a new table could record it twice** (§7).
   `Catalogue::accept` took the map entry's lock, appended the schema record —
   and then *released* the lock before publishing the schema, because a vacant
