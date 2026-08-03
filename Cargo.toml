@@ -95,7 +95,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Phase 4 micro-benchmarks. Statistical, so it belongs on components a benchmark
 # can hold still — not on anything that crosses the network, where jitter
 # invalidates its estimates. That measurement has its own harness.
-criterion = "0.7"
+criterion = "0.8"
 proptest = "1"
 # A self-signed certificate for the TLS test (§9). Generated in the test rather
 # than checked in: a committed key is a key, however clearly it is labelled a
