@@ -109,8 +109,11 @@ impl TableCatalogue {
     pub fn accept(&self, table: &str, incoming: &Schema) -> Result<SchemaRef, CatalogueError> {
         // The whole read-merge-record-publish runs under the entry's lock, so two
         // writers meeting on a new table cannot split it across two schemas or
-        // record it twice.
-        let mut entry = self.tables.entry(table.to_owned());
+        // record it twice. Holding it to the end is the point: the lock is what
+        // makes recording and publishing one step, and a writer that let go
+        // between them would leave the table looking absent to the next one,
+        // which would then record it a second time.
+        let entry = self.tables.entry(table.to_owned());
 
         let merged = match &entry {
             dashmap::mapref::entry::Entry::Occupied(held) => held.get().merge(incoming)?,
@@ -130,16 +133,14 @@ impl TableCatalogue {
         }
 
         let storage = merged.storage();
-        match &mut entry {
-            dashmap::mapref::entry::Entry::Occupied(held) => {
+        // By value, so the guard lives until the insert is done. Consuming the
+        // vacant entry is what keeps this inside the lock the entry took.
+        match entry {
+            dashmap::mapref::entry::Entry::Occupied(mut held) => {
                 held.insert(merged);
             }
-            dashmap::mapref::entry::Entry::Vacant(_) => {
-                // Vacant cannot be consumed through a shared borrow, so the
-                // insert goes through the map directly. Still under the shard's
-                // lock, which the entry guard holds.
-                drop(entry);
-                self.tables.insert(table.to_owned(), merged);
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(merged);
             }
         }
 
@@ -583,23 +584,46 @@ mod tests {
 
     /// The ingestion path is concurrent (§7), so two writers meeting on a new
     /// table must not split it into two schemas or record it twice.
+    ///
+    /// A race cannot be made to happen on demand, so this narrows the window
+    /// two ways rather than hoping: a barrier releases every thread into
+    /// [`TableCatalogue::accept`] at once, and the whole thing repeats over
+    /// fresh catalogues. Against the unsynchronised version this failed on
+    /// every one of 20 runs; the plain single-round form it replaces failed on
+    /// 8 of 60, which is how it reached CI and reddened an unrelated pull
+    /// request.
     #[test]
     fn concurrent_first_use_of_one_table_records_it_once() {
+        use std::sync::Barrier;
         use std::thread;
 
-        let (log, catalogue) = fresh();
-        let catalogue = Arc::new(catalogue);
+        const WRITERS: usize = 16;
+        const ROUNDS: usize = 24;
 
-        let handles: Vec<_> = (0..16)
-            .map(|_| {
-                let catalogue = Arc::clone(&catalogue);
-                thread::spawn(move || catalogue.accept("readings", &value_only()).unwrap())
-            })
-            .collect();
-        for handle in handles {
-            handle.join().expect("worker panicked");
+        for round in 0..ROUNDS {
+            let (log, catalogue) = fresh();
+            let catalogue = Arc::new(catalogue);
+            let barrier = Arc::new(Barrier::new(WRITERS));
+
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    let catalogue = Arc::clone(&catalogue);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        catalogue.accept("readings", &value_only()).unwrap()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("worker panicked");
+            }
+
+            assert_eq!(
+                log.appended().len(),
+                1,
+                "the table was recorded twice in round {round}"
+            );
         }
-
-        assert_eq!(log.appended().len(), 1, "the table was recorded twice");
     }
 }
