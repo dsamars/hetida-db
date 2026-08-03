@@ -89,6 +89,21 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
   twice with an identical file and row count should be checked for empty
   partitions.
 
+- **A compacted partition was compacted again on every pass.** The trigger was
+  the file count alone, and compaction emits several files for a partition
+  larger than `target_bytes` — so any such partition stayed above `max_files`
+  and was merged repeatedly, producing the same rows in the same slices each
+  time. In the 224.5 M-row load above, eight partitions were merged twenty
+  times between them.
+
+  A partition holding nothing but the output of one pass is now left alone. The
+  test is the generation in the file names rather than their number, so a flush
+  landing in a compacted partition — generation 0 among the rest — makes it due
+  again, as do files of mixed generations left by an interrupted pass. Changing
+  `target_bytes` consequently does not re-slice a partition until something is
+  written to it; re-slicing on a configuration change would rewrite every
+  partition in the archive on the next pass.
+
 - **Two writers meeting on a new table could record it twice** (§7).
   `Catalogue::accept` took the map entry's lock, appended the schema record —
   and then *released* the lock before publishing the schema, because a vacant
