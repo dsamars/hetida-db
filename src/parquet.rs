@@ -5,6 +5,8 @@
 //!
 //! One frozen memtable becomes one file, named `part-<seq>.parquet` after the
 //! highest `seq` it holds, so file names order the same way their contents do.
+//! Compaction writes `part-<seq>-g<generation>-c<index>.parquet`, one generation
+//! above the files it merged — see [`Output`].
 //!
 //! # What the file must guarantee
 //!
@@ -111,20 +113,57 @@ pub struct WrittenFile {
     pub max_seq: Seq,
 }
 
+/// Which output of which compaction pass a file is.
+///
+/// The generation is what keeps an output from ever taking an input's name.
+/// `max_seq` and the index alone do not: a pass over an unchanged input set
+/// reproduces both exactly, so its outputs would be named after the very files
+/// it then deletes — and the partition would be emptied. Naming a pass one
+/// generation above its inputs makes that arithmetically impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Output {
+    /// One past the highest generation among the pass's inputs.
+    pub generation: u32,
+    /// Position among the outputs of this pass.
+    pub index: u32,
+}
+
+impl Output {
+    /// An output of `generation` at `index`.
+    pub fn new(generation: u32, index: u32) -> Self {
+        Self { generation, index }
+    }
+}
+
 /// File name for a partition file holding up to `max_seq`.
 ///
-/// `discriminator` distinguishes files that would otherwise share a name: a
-/// compaction re-emitting the same `max_seq` as one of its inputs must not
-/// collide with it, and the store has no rename to work around that. `None` is
-/// the flush path's plain name.
+/// `output` is `None` for the flush path's plain name, which is generation 0.
+/// A compaction supplies its [`Output`]; see there for why the generation is
+/// part of the name and not just the index.
 ///
 /// Zero padded so lexicographic order matches sequence order, which is what makes
 /// a directory listing readable in write order.
-pub fn file_name(max_seq: Seq, discriminator: Option<u32>) -> String {
-    match discriminator {
+pub fn file_name(max_seq: Seq, output: Option<Output>) -> String {
+    match output {
         None => format!("part-{max_seq:020}.parquet"),
-        Some(index) => format!("part-{max_seq:020}-c{index:04}.parquet"),
+        Some(Output { generation, index }) => {
+            format!("part-{max_seq:020}-g{generation:04}-c{index:04}.parquet")
+        }
     }
+}
+
+/// The compaction generation `path`'s name carries.
+///
+/// A flush name, or any name this scheme did not write, is generation 0. That
+/// is the safe reading: the next output is then generation 1, whose name is
+/// shaped differently from either, so it still cannot collide.
+pub fn generation_of(path: &std::path::Path) -> u32 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once("-g"))
+        .and_then(|(_, rest)| rest.split_once("-c"))
+        .and_then(|(generation, _)| generation.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Writes `batch` as one Parquet file into `directory`.
@@ -140,7 +179,7 @@ pub fn write_partition(
     write_named(storage, directory, batch, config, None)
 }
 
-/// Writes `batch` under a name distinguished by `discriminator`.
+/// Writes `batch` under the name `output` gives it.
 ///
 /// See [`file_name`]. Used by compaction, which must not overwrite its inputs.
 pub fn write_named(
@@ -148,7 +187,7 @@ pub fn write_named(
     directory: &std::path::Path,
     batch: &RecordBatch,
     config: ParquetConfig,
-    discriminator: Option<u32>,
+    output: Option<Output>,
 ) -> Result<WrittenFile, WriteError> {
     let max_seq = check_sorted(batch)?;
 
@@ -179,8 +218,8 @@ pub fn write_named(
     // is there and `open_append` makes a name visible immediately. Writing under
     // the final name would leave a half file for a reader to open if the write
     // failed part way.
-    let path = directory.join(file_name(max_seq, discriminator));
-    let staging = directory.join(format!(".{}.tmp", file_name(max_seq, discriminator)));
+    let path = directory.join(file_name(max_seq, output));
+    let staging = directory.join(format!(".{}.tmp", file_name(max_seq, output)));
     if let Err(error) = write_staged(storage, &staging, &buffer) {
         // Leave no debris behind, whether or not this succeeds.
         let _ = storage.remove(&staging);
@@ -529,6 +568,44 @@ mod tests {
             "{ROWS} adjacent rows took {} bytes against a raw {raw}",
             file.bytes
         );
+    }
+
+    /// §3: an output of generation N never shares a name with an input, which
+    /// is what lets compaction delete its inputs by path.
+    #[test]
+    fn a_compaction_output_never_shares_a_name_with_its_generation_below() {
+        let input = file_name(42, Some(Output::new(1, 0)));
+        let output = file_name(42, Some(Output::new(2, 0)));
+
+        assert_ne!(input, output);
+    }
+
+    /// A flush writes generation 0, so the first compaction's outputs cannot
+    /// collide with the files it merged.
+    #[test]
+    fn a_flush_name_is_generation_zero() {
+        assert_eq!(generation_of(Path::new("part-00000000000000000042.parquet")), 0);
+    }
+
+    #[test]
+    fn a_compaction_name_reports_the_generation_it_carries() {
+        let name = file_name(42, Some(Output::new(7, 3)));
+
+        assert_eq!(generation_of(Path::new(&name)), 7);
+    }
+
+    /// Files this scheme did not write — a compaction output from before the
+    /// generation was recorded — read as generation 0. That is safe: the next
+    /// output is generation 1, whose name is shaped differently regardless.
+    #[test]
+    fn an_unrecognised_name_reads_as_generation_zero() {
+        for name in [
+            "part-00000000000000000042-c0000.parquet",
+            "something-else.parquet",
+            "part-.parquet",
+        ] {
+            assert_eq!(generation_of(Path::new(name)), 0, "{name}");
+        }
     }
 
     /// The name orders the same way its contents do, so a listing reads in write
