@@ -21,12 +21,18 @@
 //!
 //! # Recovery
 //!
-//! [`replay`] reads segments in order and stops at the first record it cannot
-//! trust — a short header, a length running past the end of the segment, or a
-//! CRC mismatch. All three are the shape a crash mid-write leaves, and none of
-//! them may prevent startup (§4). Damage is only ever at the tail, because
-//! opening the log always starts a *new* segment rather than appending to one
-//! whose end may already be torn.
+//! [`replay`] reads every segment in order. Within a segment it stops at the
+//! first record it cannot trust — a short header, a length running past the end
+//! of the segment, or a CRC mismatch. All three are the shape a crash mid-write
+//! leaves, and none of them may prevent startup (§4).
+//!
+//! Damage ends a *segment*, never the log. Opening the log always starts a new
+//! segment rather than appending to one whose end may already be torn, which
+//! means a torn segment stops being the last one the moment recovery finishes:
+//! everything acknowledged afterwards is written behind it. Treating the first
+//! tear as the end of the log would therefore discard records a client was told
+//! were durable, and in the never-reclaimed catalogue log (§4) it would discard
+//! them permanently.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,8 +127,11 @@ pub enum WalError {
 pub struct Replayed {
     /// Records in the order they were written.
     pub records: Vec<WalRecord>,
-    /// Segment whose tail was discarded, if any.
-    pub truncated: Option<PathBuf>,
+    /// Every segment whose tail was discarded, in the order they were read.
+    ///
+    /// More than one is normal after repeated crashes: each start writes into a
+    /// segment of its own, so each crash can leave its own torn tail behind.
+    pub truncated: Vec<PathBuf>,
 }
 
 /// Encodes a record into its on-disk framing.
@@ -194,10 +203,19 @@ fn segment_name(number: u64) -> String {
     format!("{number:012}.wal")
 }
 
-/// Reads every segment under `dir` in order, discarding an untrustworthy tail.
+/// Reads every segment under `dir` in order, discarding each untrustworthy tail.
 ///
 /// Never fails on damage: a torn tail is the expected state after a crash, and
 /// refusing to start would turn a recoverable crash into an outage (§4).
+///
+/// **Damage truncates one segment, not the log.** A torn tail is only the end of
+/// the segment that was active when the crash happened; recovery then opens a
+/// *new* segment, so everything acknowledged afterwards lives behind the damage.
+/// Stopping at the first tear would discard exactly those records — data a
+/// client was told was durable (§4) — so every remaining segment is read. This
+/// is sound because a segment is framed independently of its neighbours: its
+/// records carry their own lengths and CRCs, and none of that depends on where
+/// the previous segment happened to stop.
 pub fn replay(storage: &dyn Storage, dir: &Path) -> Result<Replayed, WalError> {
     let mut replayed = Replayed::default();
 
@@ -206,9 +224,7 @@ pub fn replay(storage: &dyn Storage, dir: &Path) -> Result<Replayed, WalError> {
         let (records, truncated) = decode_segment(&bytes);
         replayed.records.extend(records);
         if truncated {
-            replayed.truncated = Some(segment);
-            // Damage is only ever at the tail, so nothing beyond it is trusted.
-            break;
+            replayed.truncated.push(segment);
         }
     }
 
@@ -598,6 +614,91 @@ mod tests {
         writer.write_all(&[record(1, b"truncated header")]).unwrap();
 
         assert_eq!(replay_of(&storage), vec![record(0, b"intact")]);
+    }
+
+    /// §4: *acked* means *durable*. A crash tears the tail of the active
+    /// segment; recovery then opens a **new** segment and acknowledges into it.
+    /// The next start must still see those records — the damage behind them is
+    /// older than they are.
+    #[test]
+    fn records_written_after_a_recovery_survive_the_next_one() {
+        let storage = InMemoryStorage::new();
+        let mut first_run = writer(&storage);
+        first_run.write_all(&[record(0, b"first")]).unwrap();
+
+        storage.inject(Fault::TornWrite { keep: 4 });
+        first_run.write_all(&[record(1, b"torn")]).unwrap();
+        drop(first_run);
+
+        assert_eq!(replay_of(&storage), vec![record(0, b"first")]);
+
+        let mut second_run = writer(&storage);
+        second_run
+            .write_all(&[record(2, b"acked after recovery")])
+            .unwrap();
+        drop(second_run);
+
+        assert_eq!(
+            replay_of(&storage),
+            vec![record(0, b"first"), record(2, b"acked after recovery")],
+            "a record acknowledged after recovery was lost behind an older tear"
+        );
+    }
+
+    /// The general shape: damage is a property of one segment, not of the log.
+    /// Every segment after a torn one was written later, is framed
+    /// independently and is CRC-covered, so none of it may be discarded.
+    #[test]
+    fn a_torn_segment_does_not_hide_the_ones_after_it() {
+        let storage = InMemoryStorage::new();
+
+        let mut torn = writer(&storage);
+        torn.write_all(&[record(0, b"survives")]).unwrap();
+        storage.inject(Fault::TornWrite { keep: 4 });
+        torn.write_all(&[record(1, b"lost")]).unwrap();
+        drop(torn);
+
+        // Each open starts a fresh segment, so these land behind the damage.
+        let mut second = writer(&storage);
+        second.write_all(&[record(2, b"second segment")]).unwrap();
+        drop(second);
+        let mut third = writer(&storage);
+        third.write_all(&[record(3, b"third segment")]).unwrap();
+        drop(third);
+
+        let seqs: Vec<Seq> = replay_of(&storage).iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![0, 2, 3]);
+    }
+
+    /// Damage stays visible to the operator even though it no longer stops the
+    /// replay: every segment that lost a tail is named, not just the first.
+    #[test]
+    fn every_damaged_segment_is_reported() {
+        let storage = InMemoryStorage::new();
+
+        let mut first = writer(&storage);
+        first.write_all(&[record(0, b"intact")]).unwrap();
+        storage.inject(Fault::TornWrite { keep: 4 });
+        first.write_all(&[record(1, b"torn")]).unwrap();
+        drop(first);
+
+        let mut second = writer(&storage);
+        second.write_all(&[record(2, b"intact")]).unwrap();
+        storage.inject(Fault::TornWrite { keep: 4 });
+        second.write_all(&[record(3, b"torn")]).unwrap();
+        drop(second);
+
+        let replayed = replay(&storage, &dir()).unwrap();
+        assert_eq!(
+            replayed.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            replayed.truncated.len(),
+            2,
+            "both damaged segments must be reported: {:?}",
+            replayed.truncated
+        );
     }
 
     #[test]

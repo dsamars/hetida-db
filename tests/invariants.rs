@@ -204,7 +204,7 @@ proptest! {
         let recovered = replay(&storage, Path::new("wal"))?;
 
         prop_assert_eq!(recovered.records, records);
-        prop_assert_eq!(recovered.truncated, None);
+        prop_assert!(recovered.truncated.is_empty());
     }
 
     /// §4: this is the recovery guarantee itself. Cut the log at *any* byte and

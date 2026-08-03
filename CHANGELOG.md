@@ -11,6 +11,25 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ## [Unreleased]
 
+### Fixed
+
+- **Records written after a crash recovery could be lost on the next start.**
+  Replay stopped at the first segment with a torn tail. Recovery then opened a
+  *new* segment, so everything acknowledged afterwards lived behind the damage
+  and was skipped by every later replay — contradicting §4's *acked means
+  durable*. Replay now reads every segment: a tear ends its own segment, not the
+  log, which is sound because each segment is framed independently.
+
+  In the data log the exposure was a window, closing whenever a checkpoint
+  reclaimed the damaged segment. In the **catalogue log it was permanent and
+  worse than loss**: that log is never reclaimed, so registrations and schema
+  changes made after any crash stayed invisible, and the registry re-issued
+  those `metric_id`s to other series while rows already in Parquet still carried
+  them (§10).
+
+  An archive that has never crashed mid-write is unaffected. One that has should
+  be checked for series whose history changes meaning at a `seq` boundary.
+
 ## [0.1.0-alpha.1] — 2026-08-03
 
 First alpha, and the first release of any kind. Every task in

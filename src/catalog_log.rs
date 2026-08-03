@@ -80,8 +80,14 @@ pub struct RecoveredCatalog {
     /// Schema records in the order they were logged, so the last one for a
     /// table is its current schema (§6).
     pub schemas: Vec<SchemaRecord>,
-    /// Segment whose tail was discarded, if any.
-    pub truncated: Option<PathBuf>,
+    /// Every segment whose tail was discarded.
+    ///
+    /// This log is never reclaimed (§4), so a damaged segment stays on disk for
+    /// the life of the archive. That is exactly why the replay must not stop at
+    /// it: doing so would hide every registration and schema written after the
+    /// crash, permanently, and the registry would then re-issue ids that rows
+    /// already in Parquet use for other series (§10).
+    pub truncated: Vec<PathBuf>,
     /// Records that passed their CRC but could not be decoded, and were skipped.
     ///
     /// Non-zero means the log holds something this build does not understand.
@@ -360,7 +366,7 @@ mod tests {
             vec![Registration { id, key: series }]
         );
         assert_eq!(recovered.undecodable, 0);
-        assert_eq!(recovered.truncated, None);
+        assert!(recovered.truncated.is_empty());
     }
 
     /// §10: the same labels in any order are the same series, so the encoding
@@ -457,12 +463,48 @@ mod tests {
 
         let recovered = recover(&storage);
         assert_eq!(recovered.registrations.len(), 1, "the torn record must go");
-        assert!(recovered.truncated.is_some());
+        assert!(!recovered.truncated.is_empty());
 
         // A fresh start must not fail, and the freed id goes to the next series.
         let restarted = logged_registry(&storage);
         restarted.replay(recovered.registrations).unwrap();
         assert_eq!(restarted.register(key("other", &[])).unwrap(), 1);
+    }
+
+    /// §4 + §10: the severe half of the tear. This log is **never reclaimed**,
+    /// so a torn segment stays on disk for the life of the archive. A replay
+    /// that stopped at it would hide every registration made after the crash on
+    /// every later start — permanently — and the registry would then re-issue
+    /// those ids to different series while rows already in Parquet still carry
+    /// them. That is silent corruption, not loss.
+    #[test]
+    fn registrations_made_after_a_torn_segment_are_not_lost_forever() {
+        let storage = InMemoryStorage::new();
+
+        let first_run = logged_registry(&storage);
+        let temp = first_run.register(key("temp", &[])).unwrap();
+        storage.inject(Fault::TornWrite { keep: 6 });
+        first_run.register(key("torn", &[])).unwrap();
+
+        // Recovery, then a fresh run registers into a segment behind the damage.
+        let recovered = recover(&storage);
+        let second_run = logged_registry(&storage);
+        second_run.replay(recovered.registrations).unwrap();
+        let flow = second_run.register(key("flow", &[("line", "1")])).unwrap();
+
+        // Every later start must still see both.
+        let later = recover(&storage);
+        let restarted = logged_registry(&storage);
+        restarted.replay(later.registrations).unwrap();
+
+        assert_eq!(restarted.resolve(&key("temp", &[])), Some(temp));
+        assert_eq!(
+            restarted.resolve(&key("flow", &[("line", "1")])),
+            Some(flow),
+            "a registration written behind an older tear was lost permanently"
+        );
+        // The id must not come back around to a different series.
+        assert_ne!(restarted.register(key("third", &[])).unwrap(), flow);
     }
 
     #[test]
