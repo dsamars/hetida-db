@@ -24,7 +24,7 @@ newest released minor.
 Report privately through GitHub:
 [Security → Report a vulnerability](https://github.com/dsamars/hetida-db/security/advisories/new).
 This opens a draft advisory only the maintainers and you can read. If that is
-not available to you, email <hdietz@fuseki.com> instead.
+not available to you, email <hdietz@outlook.com> instead.
 
 Useful in a report: the version or commit, the configuration involved
 (especially whether `allow_plaintext` or `allow_anonymous` was set), and the
