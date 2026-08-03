@@ -27,7 +27,7 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Implement partition routing: split each incoming `RecordBatch` by the configured interval at insert time, since one batch may span interval boundaries (§3, §11). *One memtable per partition (§2) sharing one suppression index per table (§1); a single-partition batch passes through uncopied.*
 - [x] Implement freeze-and-swap so a flush never blocks ingestion: freeze the active `MemTable`, open a new one, hand the frozen one to the background writer (§2).
 - [x] Build append-only WAL with group commit (shared fsync, configurable max delay), per-record CRC, segment rotation, and checkpoint records for segment reclamation (§4).
-- [x] Implement WAL replay: apply segments in sequence order, truncate at the first torn record, never fail startup on a damaged tail (§4).
+- [x] Implement WAL replay: apply segments in sequence order, truncate at the first torn record, never fail startup on a damaged tail (§4). *Corrected afterwards: the tear truncates its own segment, not the log. Stopping at the first one hid everything written after the following recovery — a window in the data log, permanent in the never-reclaimed catalogue log.*
 - [x] Implement Arrow Flight `do_put` streaming endpoint ingesting `RecordBatch` payload directly: assign sequence numbers, resolve the target table from `FlightDescriptor::path`, acknowledge only after fsync (§4, §5). *Batch replay into memtables lands with it, closing the startup gap.*
 - [x] Implement backpressure: acknowledgements produced lazily so gRPC flow control carries the pressure back, plus `RESOURCE_EXHAUSTED` past the hard `MemTable` memory cap (§7).
 

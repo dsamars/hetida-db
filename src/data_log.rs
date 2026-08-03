@@ -81,7 +81,7 @@ pub fn decode_batch(bytes: &[u8]) -> Option<(String, RecordBatch)> {
 pub fn replay_data(storage: &dyn Storage, dir: &Path) -> Result<RecoveredData, WalError> {
     let replayed = replay(storage, dir)?;
     let mut recovered = RecoveredData {
-        truncated: replayed.truncated.is_some(),
+        truncated: !replayed.truncated.is_empty(),
         ..RecoveredData::default()
     };
 

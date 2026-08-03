@@ -238,7 +238,7 @@ impl Archive {
             schemas: recovered_catalogue.schemas.len(),
             undecodable: recovered_catalogue.undecodable,
             data_records: 0,
-            truncated: recovered_catalogue.truncated.is_some() || data.truncated.is_some(),
+            truncated: !recovered_catalogue.truncated.is_empty() || !data.truncated.is_empty(),
             resumed_at: resume_at,
         };
 
