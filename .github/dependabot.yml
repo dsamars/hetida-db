@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      # The repository writes commit subjects as prose, not as a machine
+      # convention (CONTRIBUTING.md). Dependabot cannot be taught that, so its
+      # subjects are left in its own form rather than given a fake prefix.
+      prefix: ""
+    groups:
+      # arrow, parquet, arrow-flight and datafusion must resolve to one Arrow
+      # major or their types conflict across crate boundaries (CLAUDE.md,
+      # *Version Alignment*). Bumped one at a time they do not compile, so they
+      # are one pull request — and it is reviewed by picking the DataFusion
+      # version first and deriving the rest, never the other way round.
+      arrow-stack:
+        patterns:
+          - arrow
+          - arrow-*
+          - parquet
+          - datafusion
+          - datafusion-*
+          - object_store
+      # tonic and prost carry Flight's own generated types; the same argument
+      # applies to them as a pair.
+      grpc-stack:
+        patterns:
+          - tonic
+          - tonic-*
+          - prost
+          - prost-*
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"

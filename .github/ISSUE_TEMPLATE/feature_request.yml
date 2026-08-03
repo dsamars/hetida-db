@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+name: Feature request
+description: Something the archive should be able to do and cannot
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Open this before writing code. A pull request that arrives without an
+        agreed problem may be right and still be closed, because agreeing on the
+        problem is cheaper than reviewing the wrong solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What you were trying to do, and where the archive stopped you. Describe
+        the situation rather than the feature — the feature is what we work out
+        together.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: Optional. If you already have a shape for it, describe it.
+
+  - type: textarea
+    id: decisions
+    attributes:
+      label: Decisions it touches
+      description: |
+        Which numbered decisions in `ARCHITECTURE.md` this would work under, and
+        whether it contradicts any of them. A proposal that contradicts one is
+        not out of bounds — but it has to argue against the recorded rationale,
+        not around it.
+      placeholder: "§1 versioning, §8 retention"
+
+  - type: dropdown
+    id: open-question
+    attributes:
+      label: Is this already an Open Question?
+      description: |
+        `ARCHITECTURE.md` records deferred work at the bottom. If this is one of
+        them, say which — the issue then becomes the place to settle it.
+      options:
+        - "No"
+        - "Query cost limits (§5)"
+        - "Downsampling / rollup before retention (§8)"
+        - "OIDC/JWT or mTLS credential backends (§9)"
+        - "Tiered partition intervals (§11)"
+    validations:
+      required: true

@@ -88,6 +88,13 @@ The observation point travels in the `Ticket` beside the SQL as `hetida.v1.Query
 - [`CLAUDE.md`](CLAUDE.md) — performance, quality and documentation rules for contributors
 - [`tasks.md`](tasks.md) — phased implementation plan
 - [`CHANGELOG.md`](CHANGELOG.md) — what each release contains, and what it does not
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch model, the test-first workflow, and what a pull request is judged against
+- [`RELEASING.md`](RELEASING.md) — how a release is cut
+- [`SECURITY.md`](SECURITY.md) — reporting a vulnerability, and what an alpha already tells you
+
+Building it needs Rust 1.88 or newer, which is what `datafusion` and `tonic`
+require. `protoc` is not needed: the control-plane contract is compiled by
+`protox`, in pure Rust.
 
 ## Status
 

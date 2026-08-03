@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+# The quality gate from CLAUDE.md, run where it cannot be skipped. The job names
+# below are what branch protection requires on `main`, so renaming one silently
+# removes a required check — rename it in the branch rule at the same time.
+name: CI
+
+on:
+  push:
+    branches: [main, "release/*"]
+  pull_request:
+    branches: [main, "release/*"]
+
+# A second push to the same branch supersedes the first; nothing is learned from
+# finishing a run for a commit nobody will merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning in CI is a warning that will be ignored. Fail on it instead.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # `protox` compiles the .proto in pure Rust, so no protoc is installed
+      # here — see the build-dependencies comment in Cargo.toml.
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      # `--all-targets` skips doc-tests; they are cheap and assert the examples
+      # in doc comments still compile.
+      - run: cargo test --doc
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Tests and benches too: the zero-panic lints are denied in production
+      # modules, and a bench that stops compiling is a bench nobody runs.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `missing_docs` is warned about in the crate, and a warning that only
+      # appears locally is one that accumulates. RUSTDOCFLAGS also catches
+      # broken intra-doc links, which no other job sees.
+      - run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The `rust-version` in Cargo.toml, which is what datafusion and tonic
+      # require. Checked rather than assumed: a dependency bump raising it is
+      # a breaking change for anyone pinned to the old toolchain.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

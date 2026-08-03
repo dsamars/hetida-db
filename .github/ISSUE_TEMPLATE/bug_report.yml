@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+name: Bug report
+description: Something the archive does that it should not, or fails to do
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Not for security defects.** A way to read or write a table without a
+        grant, to escape the observation point, or to crash the server
+        unauthenticated goes to [Security → Report a
+        vulnerability](https://github.com/dsamars/hetida-db/security/advisories/new)
+        instead — see `SECURITY.md`.
+
+        Please check `CHANGELOG.md` under *Known limitations* first. No query
+        cost limits, no rollup, static credentials only, one partition interval
+        and one node are documented, not defects.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: |
+        The release tag you built, or the commit hash. There is no `--version`
+        flag yet, so `git describe --tags` is the reliable answer.
+      placeholder: v0.1.0-alpha.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: |
+        The smallest sequence of Flight calls or SQL that shows it. A failing
+        test against the existing suite (`tests/pipeline.rs`,
+        `tests/verification.rs`) is the fastest possible report.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: |
+        The TOML file, with passwords removed. The partition interval, the
+        retention settings and whether `allow_plaintext` or `allow_anonymous`
+        is set matter more than the rest.
+      render: toml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server output
+      render: shell
+
+  - type: input
+    id: env
+    attributes:
+      label: Platform and Rust version
+      placeholder: "macOS 15.4 arm64, rustc 1.88.0"

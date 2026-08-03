@@ -11,6 +11,11 @@ authors = ["Heiko Dietz <hdietz@outlook.com>"]
 description = "High-performance time-series archiver built on Apache Arrow Flight, Parquet and DataFusion"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/dsamars/hetida-db"
+# What datafusion 54.1 and tonic 0.14 require; nothing here reaches past it.
+# Raising this is a breaking change for anyone pinned to the old toolchain, so
+# CI builds against it rather than letting a dependency bump raise it silently.
+rust-version = "1.88"
 
 [dependencies]
 # Startup and CLI errors, where a chain of context beats a typed enum.

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+# A vulnerability must not be able to arrive as a public issue by accident.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/dsamars/hetida-db/security/advisories/new
+    about: Report privately. Never open a public issue for a security defect.
+  - name: Question about a design decision
+    url: https://github.com/dsamars/hetida-db/blob/main/ARCHITECTURE.md
+    about: The settled decisions, each with its rationale and rejected alternatives.
+  - name: Configuration reference
+    url: https://github.com/dsamars/hetida-db/blob/main/CONFIGURATION.md
+    about: Every setting, and what choosing it wrong costs.

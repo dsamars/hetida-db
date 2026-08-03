@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Heiko Dietz
+
+# Everything, for now. The point is not gatekeeping — it is that a review is
+# requested automatically rather than remembered.
+*                   @dsamars
+
+# The settled design decisions and the rules derived from them. A change here
+# is a change to what the code is allowed to be, not to what it does.
+/ARCHITECTURE.md    @dsamars
+/CLAUDE.md          @dsamars
+/CONTRIBUTING.md    @dsamars
