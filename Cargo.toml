@@ -26,10 +26,10 @@ arc-swap = "1.9.2"
 # release: arrow, parquet, arrow-flight and datafusion must share one Arrow
 # major or their types conflict across crate boundaries. datafusion 54.1
 # resolves arrow 58.4, so Phase 3 must add datafusion 54.x, not a newer line.
-arrow = "58.4"
+arrow = "59.1"
 # The wire protocol (§5). Same Arrow version as above, by the rule in that
 # comment: it exchanges Arrow types across the crate boundary.
-arrow-flight = "58.4"
+arrow-flight = "59.1"
 # `ObjectStore` is an async trait, and this is the crate it is declared with.
 async-trait = "0.1"
 bytes = "1"
@@ -48,10 +48,10 @@ futures = "0.3"
 # DataFusion reads Parquet through this, so the archive's own `Storage` is
 # adapted onto it rather than the query path opening files behind its back —
 # one store, one truth. Pinned to the line datafusion 54.1 resolves.
-object_store = "0.13"
+object_store = "0.14"
 # The archive format. Same Arrow version as above, by the rule in that comment:
 # it writes Arrow types straight to disk.
-parquet = { version = "58.4", features = ["zstd"] }
+parquet = { version = "59.1", features = ["zstd"] }
 # Control-plane message types (§5), generated from proto/hetida.proto. Pinned to
 # the line arrow-flight resolves, since Flight's own messages use the same one.
 prost = "0.14"
