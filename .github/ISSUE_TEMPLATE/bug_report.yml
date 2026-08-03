@@ -21,11 +21,11 @@ body:
   - type: input
     id: version
     attributes:
-      label: Version or commit
+      label: Version
       description: |
-        The release tag you built, or the commit hash. There is no `--version`
-        flag yet, so `git describe --tags` is the reliable answer.
-      placeholder: v0.1.0-alpha.1
+        The output of `hetida-db --version`. It carries the commit as well as
+        the release, which is what distinguishes two builds between tags.
+      placeholder: 0.1.0-alpha.1 (v0.1.0-alpha.1-8-g42e1a43)
     validations:
       required: true
 

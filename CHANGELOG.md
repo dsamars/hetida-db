@@ -13,6 +13,14 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ### Added
 
+- **`--version` and `--help`.** The version carries the commit as well as the
+  release (`0.1.0-alpha.1 (v0.1.0-alpha.1-8-g42e1a43)`), because a version alone
+  does not identify a build between tags — which is where bug reports come from.
+  A build with no `.git` reports the package version alone rather than a guess.
+  An unrecognised argument is now **refused by name** instead of ignored, on the
+  configuration file's rule: a flag silently dropped leaves an operator believing
+  a setting is in effect.
+
 - **The server can be seen into** (§13). `tracing` throughout, configured from a
   new `[observability]` section: `level` (a closed set of the five levels),
   `format` (`text` or `json`), and `filter` for a full directive when a level
