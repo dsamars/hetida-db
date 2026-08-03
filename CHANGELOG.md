@@ -11,6 +11,30 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ## [Unreleased]
 
+### Added
+
+- **The on-disk format is versioned** (§12). One number covers the archive: it is
+  recorded in `instance.meta`, stamped into each WAL segment's header and into
+  each Parquet footer. A build refuses a version it does not know, naming both
+  numbers, before either log is replayed — the point of doing this now is that
+  after 0.1.0 a versionless file and a versioned one could only be told apart by
+  heuristic, and the heuristic would become the format.
+
+  A WAL segment from a newer build is a **startup error, not a torn tail**: it is
+  intact and holds acknowledged rows, so skipping it would answer queries from an
+  archive only partly read. A torn segment header remains an ordinary tear.
+
+  The Parquet stamp is deliberately **written but not checked**: the
+  instance-level gate already covers every file the archive owns, and a Parquet
+  file carries its own schema, so a misread fails as a schema mismatch rather
+  than as plausible nonsense. It cannot be added to a file already on disk, which
+  is why it lands now.
+
+  **Breaking:** an archive created by `0.1.0-alpha.1` refuses to open — it
+  records no version, and reading it as version 1 would be a compatibility claim
+  owed forever. Re-create the archive; releases before 0.1.0 carry no migration
+  path.
+
 ### Fixed
 
 - **Records written after a crash recovery could be lost on the next start.**
