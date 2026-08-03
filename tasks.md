@@ -65,3 +65,14 @@ Every task is executed test-first: its tests are written and failing before any 
 - [x] Benchmark the partition interval variants (`hour`/`day`/`month`/`year`) against the real workload — few metrics over weeks to months — reporting files opened, bytes scanned and latency, to settle the default empirically (§11). *Recorded in §11. Rules out `hour` and `day` decisively; does not separate `month` from `year` at a thirty-day span, and says so.*
 - [x] Verify retention: expired partitions are dropped, live partitions stay untouched, expired-range ingestion is rejected. *All three in `tests/pipeline.rs`, end to end from ingest through flush to the reaper and back to a refused write.*
 - [x] Verify authorization: unauthenticated calls are refused, and per-table grants are enforced on both `do_put` and `do_get`. *`tests/authorization.rs` against a real server, including grants over rows already in Parquet and a token expiring mid-session.*
+
+## Phase 5: Toward 0.1.0
+
+`0.1.0` is the release that stops saying *nothing here is stable*. These are the things that have to be true before it can say anything else, in the order their cost grows if deferred.
+
+- [ ] Record the archive's format version in `instance.meta` and validate it at startup, refusing an unknown version by name and refusing an archive written before versioning existed (§12).
+- [ ] Give each WAL segment a header carrying the magic and the version, in both logs. A newer version is a startup error; a torn header is an ordinary torn tail (§4, §12).
+- [ ] Stamp the format version into Parquet footer metadata on write. Deliberately unchecked on read — the instance gate covers it and a Parquet file is self-describing (§12).
+- [ ] Introduce `tracing` with spans over `do_put` and `do_get` and counters on the four background loops (flush, compaction, retention, group commit), replacing the twenty `println!`/`eprintln!` calls. Nobody can operate an archive they cannot see into, and the Phase 4 numbers are only reproducible on loopback without it.
+- [ ] **Blocked — needs a decision.** Query cost limits for client-supplied SQL. It is an *Open Question* in `ARCHITECTURE.md`, not a settled decision, and `SECURITY.md` currently tells operators not to grant read access to anyone they would not give a shell. That sentence is acceptable in an alpha and not in `0.1.0`, because it makes per-table authorization decorative: it governs *which* table a client reads, not whether the client can stop the server. Settle the shape first — planner-level limits, a timeout, a scanned-bytes cap, or some combination.
+- [ ] Add a `--version` flag to the binary. Minor, but the bug report form has to fall back to `git describe` without it.
