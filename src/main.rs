@@ -17,6 +17,7 @@ use tonic::transport::Server;
 
 use hetida_db::archive::Archive;
 use hetida_db::auth::{DEFAULT_TOKEN_TTL, SystemTokens, TokenIssuer};
+use hetida_db::cli;
 use hetida_db::clock::{Clock, SystemClock};
 use hetida_db::compact::{Compactor, partition_dirs};
 use hetida_db::config::{CONFIG_VAR, FileConfig};
@@ -29,6 +30,29 @@ use hetida_db::storage::FileStorage;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Answered before anything else: neither needs a configuration, and asking
+    // which build this is should work on a host where the archive will not open.
+    // These print to stdout rather than through `tracing` — they are the
+    // program's answer, not a diagnostic, and there is no subscriber yet (§13).
+    match cli::parse(std::env::args().skip(1)) {
+        cli::Request::Serve => {}
+        cli::Request::Version => {
+            println!("hetida-db {}", cli::version());
+            return Ok(());
+        }
+        cli::Request::Help => {
+            println!("{}", cli::usage());
+            return Ok(());
+        }
+        cli::Request::Unknown(argument) => {
+            anyhow::bail!(
+                "`{argument}` is not an option this build knows; \
+                 try `--help`. Everything except `--version` and `--help` is \
+                 configured in the file {CONFIG_VAR} names"
+            );
+        }
+    }
+
     // §9: a variable that used to work and is now ignored would deploy a server
     // listening somewhere else, or with its credentials silently dropped. Say so
     // and stop, rather than start something the operator did not ask for.

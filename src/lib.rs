@@ -55,6 +55,7 @@ pub mod archive;
 pub mod auth;
 pub mod catalog;
 pub mod catalog_log;
+pub mod cli;
 pub mod clock;
 pub mod compact;
 pub mod config;
