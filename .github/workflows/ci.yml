@@ -32,7 +32,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # `protox` compiles the .proto in pure Rust, so no protoc is installed
       # here — see the build-dependencies comment in Cargo.toml.
@@ -46,7 +46,7 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -60,7 +60,7 @@ jobs:
     name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `missing_docs` is warned about in the crate, and a warning that only
@@ -74,10 +74,10 @@ jobs:
     name: msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The `rust-version` in Cargo.toml, which is what datafusion and tonic
       # require. Checked rather than assumed: a dependency bump raising it is
       # a breaking change for anyone pinned to the old toolchain.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.100
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
