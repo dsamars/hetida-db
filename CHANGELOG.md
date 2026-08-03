@@ -64,6 +64,23 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ### Fixed
 
+- **Two writers meeting on a new table could record it twice** (§7).
+  `Catalogue::accept` took the map entry's lock, appended the schema record —
+  and then *released* the lock before publishing the schema, because a vacant
+  entry cannot be filled through a shared borrow. In that window the table
+  still looked absent, so a second writer appended a second record for it. The
+  catalogue log is never reclaimed, so the duplicate is replayed on every
+  subsequent start.
+
+  The vacant entry is now consumed by value, which keeps recording and
+  publishing inside the one lock the comment there always claimed they were in.
+
+  This is also what made `concurrent_first_use_of_one_table_records_it_once`
+  flaky — it failed 8 times in 60 runs and reddened unrelated pull requests.
+  The test now releases its writers from a barrier and repeats over fresh
+  catalogues: 20 of 20 runs red against the unsynchronised version, 0 of 100
+  after the fix.
+
 - **Records written after a crash recovery could be lost on the next start.**
   Replay stopped at the first segment with a torn tail. Recovery then opened a
   *new* segment, so everything acknowledged afterwards lived behind the damage
