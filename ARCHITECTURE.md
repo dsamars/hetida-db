@@ -227,7 +227,7 @@ Retention has a **second, independent dimension** since §1:
 
 ## Open Questions
 
-- **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients.
+- **Query cost limits** for client-supplied SQL (§5) — required before untrusted clients. *Weighed for 0.1.0 on 2026-08-03 and deliberately deferred, so it is not reopened as an oversight.* The consequence is that per-table authorization (§9) governs **which** table a reader may read and not whether that reader can exhaust the server: a grant is a statement about data, not about cost. Until this is settled, read access is only as safe as the people holding it, and `SECURITY.md` says so. Deciding it means choosing the shape — planner-level limits before execution, a wall-clock timeout, a cap on scanned bytes, or a combination — and the scope: per instance, per table, or per credential.
 - **Downsampling / rollup** before retention deletion (§8) — deferred.
 - **OIDC/JWT and mTLS credential backends** (§9) — deferred; the trait must not preclude them.
 - **A metrics endpoint** (§13) — Prometheus or OTLP. Deferred: a second listener is a second thing to secure, and a metric naming scheme is harder to change later than a log field. Structured events carry the same numbers today.
