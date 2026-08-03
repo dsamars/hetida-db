@@ -482,11 +482,28 @@ impl FlightService for HetidaFlightService {
         let query = query_from(&request.into_inner().ticket)?;
         self.authorize_read(&query, principal.as_ref()).await?;
 
-        let results = self
-            .engine
-            .stream(&query.sql, query.as_of_micros)
-            .await
-            .map_err(query_status)?;
+        // §13: per call, not per batch — a query answering from memory returns
+        // in under a millisecond, and this sits beside a planner that does not.
+        let results = match self.engine.stream(&query.sql, query.as_of_micros).await {
+            Ok(results) => results,
+            Err(error) => {
+                // A query that would not plan is the operator's problem to see:
+                // it is the client's fault far more often than the server's, and
+                // it is invisible from the server side otherwise.
+                tracing::warn!(
+                    sql = %query.sql,
+                    as_of = ?query.as_of_micros,
+                    error = %error,
+                    "query refused"
+                );
+                return Err(query_status(error));
+            }
+        };
+        tracing::debug!(
+            sql = %query.sql,
+            as_of = ?query.as_of_micros,
+            "query planned, streaming"
+        );
 
         let batches = results.map_err(|error| FlightError::ExternalError(Box::new(error)));
         let encoded = FlightDataEncoderBuilder::new()
@@ -543,9 +560,32 @@ impl FlightService for HetidaFlightService {
             batches.poll_next_unpin(context).map(|batch| {
                 batch.map(|batch| {
                     let batch = batch.map_err(|error| {
+                        tracing::warn!(table = %table, error = %error, "malformed flight data");
                         Status::invalid_argument(format!("malformed flight data: {error}"))
                     })?;
-                    let outcome = archive.ingest(&table, &batch).map_err(ingest_status)?;
+                    // §13: one event per batch, never per row. At 300 000 rows/s
+                    // a per-row event would dominate everything it measures.
+                    let outcome = match archive.ingest(&table, &batch) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            // A refused write is the one thing a client sees and
+                            // the server would otherwise not record at all.
+                            tracing::warn!(
+                                table = %table,
+                                rows = batch.num_rows(),
+                                error = %error,
+                                "ingest refused"
+                            );
+                            return Err(ingest_status(error));
+                        }
+                    };
+                    tracing::debug!(
+                        table = %table,
+                        rows = batch.num_rows(),
+                        inserted = outcome.inserted,
+                        suppressed = outcome.suppressed,
+                        "batch ingested"
+                    );
                     Ok(PutResult {
                         app_metadata: format!(
                             "{{\"inserted\":{},\"suppressed\":{}}}",
@@ -1191,6 +1231,76 @@ mod tests {
             status.message().contains("retention"),
             "the client must be told why: {}",
             status.message()
+        );
+    }
+
+    /// §13: a refused write is the one thing the client sees and the server
+    /// would otherwise never record. It is `warn`, not `error` — the archive is
+    /// healthy and the client is being told to stop — and it carries the table
+    /// and the reason, because an operator cannot ask the client what happened.
+    ///
+    /// A current-thread runtime built inside the capture, rather than
+    /// `#[tokio::test]`: the subscriber is thread-local, so the server task has
+    /// to run on the thread that installed it.
+    #[test]
+    fn a_refused_write_is_logged_with_its_table_and_reason() {
+        const AUGUST: i64 = 1_785_681_432_000_000;
+        const JUNE: i64 = 1_781_481_600_000_000;
+        const DAY: i64 = 86_400_000_000;
+
+        let ((), events) = crate::observability::capture::capturing(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let storage = Arc::new(InMemoryStorage::new());
+                let archive = Arc::new(
+                    Archive::open(
+                        Arc::clone(&storage) as Arc<_>,
+                        &ArchiveConfig {
+                            tables: vec![(
+                                "readings".to_owned(),
+                                crate::catalog::TableConfig {
+                                    retention: Some(30 * DAY),
+                                    ..crate::catalog::TableConfig::default()
+                                },
+                            )],
+                            wal: WalConfig {
+                                segment_bytes: 64 * 1024,
+                                max_commit_delay: Duration::ZERO,
+                            },
+                            ..ArchiveConfig::default()
+                        },
+                        Arc::new(TestClock::new(AUGUST)),
+                    )
+                    .unwrap(),
+                );
+                let (mut client, _) = serve_archive(Arc::clone(&archive), storage).await;
+
+                write(
+                    &mut client,
+                    "readings",
+                    vec![client_batch(&[(1, JUNE, 2.5)])],
+                )
+                .await
+                .expect_err("must be refused");
+            });
+        });
+
+        let refusal = events
+            .iter()
+            .find(|event| event.message() == "ingest refused")
+            .expect("a refused write must be recorded");
+
+        assert_eq!(refusal.level, tracing::Level::WARN);
+        assert_eq!(refusal.field("table").as_deref(), Some("readings"));
+        assert!(
+            refusal
+                .field("error")
+                .unwrap_or_default()
+                .contains("retention"),
+            "the reason must travel with it: {refusal:?}"
         );
     }
 

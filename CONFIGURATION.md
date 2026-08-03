@@ -137,6 +137,16 @@ row_group_rows = 131072
 # which is an hour.
 tick = "15m"
 
+[observability]
+# How much the server says: error, warn, info, debug or trace. Nothing else is
+# accepted — a directive parser would read a typo as a *target* of that name and
+# then log nothing at all (§13).
+level = "info"
+# How each event is rendered: text for a terminal, json for a collector.
+format = "text"
+# filter is unset. It takes a full tracing directive and overrides `level`, for
+# what a level cannot express: filter = "info,hetida_db::wal=debug"
+
 # Applies to any table [tables.*] does not name.
 [table_defaults]
 # Ingest-time span over which a byte-identical resend is recognised as a
@@ -270,6 +280,54 @@ Tokens are 32 random bytes from the operating system, hex encoded, valid for
 **12 hours**, and held in memory: a restart invalidates every one of them. That
 is correct — the archive's durable state is its data, not its sessions, and a
 client already has to handle re-handshaking.
+
+### What the server says about itself
+
+`[observability]` is the whole of it (§13). There is no `RUST_LOG`:
+`HETIDA_CONFIG` is the only environment variable this server reads, and a second
+one governing diagnostics would put them somewhere you are not looking.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `level` | `info` | `error`, `warn`, `info`, `debug` or `trace`, and nothing else. |
+| `format` | `text` | `text` for a terminal, `json` for one object per event. |
+| `filter` | unset | A full directive, overriding `level`. Validated when the file is read. |
+
+**`level` is a closed set on purpose.** Writing `level = "verbose"` is refused
+rather than accepted, because the directive syntax underneath would read
+`verbose` as the name of a *target* and enable it — leaving a server that starts
+cleanly and says nothing, which looks exactly like a server with no traffic.
+
+**`filter` is the escape hatch**, for the case a single level will not do:
+
+```toml
+[observability]
+filter = "info,hetida_db::wal=debug,hetida_db::compact=trace"
+```
+
+It is the more dangerous of the two, deliberately. It *is* lenient about unknown
+targets — a module you name may simply not have been reached yet — so a
+misspelled module there is silently ineffective. Use `level` unless you have a
+reason not to.
+
+Events go to **stderr**, so piping the server's stdout somewhere never mixes
+diagnostics into it. What each level carries:
+
+- **`error`** — something stopped. Currently only a failure to listen for
+  shutdown signals; the archive itself refuses to start rather than logging.
+- **`warn`** — something failed and will be retried, or a client was refused: a
+  torn log tail, a failed flush (with the note that ingestion will be refused if
+  memory fills — §7), a failed compaction, partitions that could not be dropped,
+  a refused write or a query that would not plan. Also the two configuration
+  decisions worth saying out loud, serving without TLS and without authorization.
+- **`info`** — what an operator wants to see happen: the archive opening, the
+  listener, each compacted or dropped partition, and the stop.
+- **`debug`** — per call and per batch: each ingested batch with its row count,
+  each planned query. Never per row (§13).
+
+A pass that did nothing says nothing. A reaper that dropped no partition and a
+compactor with nothing due are both silent, because an archive that logs a line
+per tick per table trains you to ignore the log.
 
 ### Per-table settings
 

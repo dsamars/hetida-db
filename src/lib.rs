@@ -44,6 +44,11 @@
     clippy::unreachable,
     clippy::todo
 )]
+// §13: the library emits through `tracing` and never writes to a stream itself.
+// A `println!` in here would bypass the level, the format and the destination an
+// operator configured, and would do it from a library that has no business
+// deciding any of the three. Denied mechanically, like the lints above.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod active;
 pub mod archive;
@@ -60,6 +65,7 @@ pub mod instance;
 pub mod labels;
 pub mod memtable;
 pub mod object_store;
+pub mod observability;
 pub mod parquet;
 pub mod partition;
 

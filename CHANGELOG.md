@@ -13,6 +13,25 @@ layout. Design decisions referenced as §n live in [`ARCHITECTURE.md`](ARCHITECT
 
 ### Added
 
+- **The server can be seen into** (§13). `tracing` throughout, configured from a
+  new `[observability]` section: `level` (a closed set of the five levels),
+  `format` (`text` or `json`), and `filter` for a full directive when a level
+  will not do. There is deliberately **no `RUST_LOG`** — `HETIDA_CONFIG` remains
+  the only environment variable, and diagnostics configured somewhere the
+  operator is not looking are worse than none.
+
+  The library was previously silent: `do_put` and `do_get` recorded nothing at
+  all, so a refused write or a query that would not plan existed only in the
+  client's error. Both now log at `warn` with the table or the SQL and the
+  reason; successful work logs per call and per batch at `debug`, never per row.
+  The twenty `println!`/`eprintln!` calls in the binary became structured events,
+  and `clippy::print_stdout`/`print_stderr` are denied in the library so they
+  cannot come back.
+
+  A metrics endpoint (Prometheus, OTLP) is deliberately **not** part of this and
+  is recorded under *Open Questions*: it is a second listener to secure and a
+  naming scheme harder to change than a log field.
+
 - **The on-disk format is versioned** (§12). One number covers the archive: it is
   recorded in `instance.meta`, stamped into each WAL segment's header and into
   each Parquet footer. A build refuses a version it does not know, naming both

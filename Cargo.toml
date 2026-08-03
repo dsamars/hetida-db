@@ -75,6 +75,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 # builds without cmake or a C toolchain, which keeps the archive buildable
 # wherever cargo is.
 tonic = { version = "0.14", features = ["transport", "router", "server", "channel", "codegen", "tls-ring"] }
+# The observability facade (§13). The library only ever emits through this; it
+# never installs a subscriber, because a library that chooses the output format
+# chooses it for every process that embeds it, tests included.
+tracing = "0.1"
+# The subscriber, used by the binary alone — the library must not reach for it.
+# `env-filter` is taken for its directive *parser*, not for the environment
+# variable: the level comes out of `[observability]` in the configuration file,
+# since `HETIDA_CONFIG` is the only variable this server reads (§13). `json` is
+# the machine-readable format an operator can select there.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Payload digests for §1 unchanged-value suppression. Non-cryptographic is
 # sufficient: the comparison is not adversarial — a client constructing a
 # collision would only discard its own correction, which it could equally
