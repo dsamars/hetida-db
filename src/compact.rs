@@ -124,10 +124,37 @@ pub enum CompactReason {
     },
 }
 
+/// Whether `files` are all the output of one compaction pass (§3).
+///
+/// Such a partition has nothing to gain from another: the same rows would merge
+/// into the same slices under the same target size. Without this it would be
+/// compacted on every pass for as long as it stayed above `max_files`, which a
+/// partition big enough to slice does permanently.
+///
+/// Generation, not file count, is the test — a flush landing in a compacted
+/// partition writes generation 0, so the mixture is due again, which is what
+/// makes new rows reach a merged file at all. A partition of mixed generations
+/// is likewise due: a pass was interrupted, and finishing it is real work.
+///
+/// The cost is that changing `target_bytes` does not re-slice a partition until
+/// something is written to it. Re-slicing on a configuration change would mean
+/// rewriting every partition in the archive on the next pass, which is the
+/// larger surprise of the two.
+pub fn is_settled(files: &[std::path::PathBuf]) -> bool {
+    let mut generations = files.iter().map(|file| generation_of(file));
+    let Some(first) = generations.next() else {
+        return false;
+    };
+    first > 0 && generations.all(|generation| generation == first)
+}
+
 /// Whether a partition of `files` totalling `bytes` is due (§3).
 ///
 /// A single file is never due: merging one file into one file changes nothing and
 /// would rewrite the partition on every pass.
+///
+/// This counts; it does not look at the files. [`is_settled`] is the other half
+/// of the decision and [`Compactor::compact_if_due`] applies both.
 pub fn compaction_reason(
     config: CompactConfig,
     files: usize,
@@ -173,6 +200,11 @@ impl Compactor {
 
     /// Compacts `directory` if it is due, returning `None` if it is not.
     ///
+    /// Due means over a threshold *and* not already settled — see
+    /// [`compaction_reason`] and [`is_settled`]. A partition that has just been
+    /// compacted stays above `max_files` whenever it was large enough to slice,
+    /// so the file count alone would send it round for ever.
+    ///
     /// Entries that cannot be read are skipped rather than fatal, and are never
     /// passed to [`Self::compact`] — so they are also never removed. That covers
     /// two cases with one rule: a directory handed in by mistake (a level above
@@ -191,7 +223,7 @@ impl Compactor {
             }
         }
 
-        if compaction_reason(self.config, files.len(), bytes).is_none() {
+        if is_settled(&files) || compaction_reason(self.config, files.len(), bytes).is_none() {
             return Ok(None);
         }
         self.compact(directory, &files).map(Some)
@@ -735,6 +767,10 @@ mod tests {
     /// and third passes do nothing at all. The case only exists once compaction
     /// emits several files — then the partition is still over `max_files`
     /// afterwards and comes round again with its inputs unchanged.
+    /// Driven through [`Compactor::compact`] rather than `compact_if_due`, which
+    /// [`is_settled`] would turn away: the safety of a pass may not rest on the
+    /// policy deciding when to run one. A caller that merges a partition twice —
+    /// a manual pass, a future scheduler — must still not lose a row.
     #[test]
     fn recompacting_a_sliced_partition_keeps_every_row() {
         let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
@@ -748,17 +784,91 @@ mod tests {
         // how the idempotence test above came to be green.
         assert!(
             first.written.len() >= 2,
-            "the setup must leave the partition due again, got {} output(s)",
+            "the setup must leave several files to merge again, got {}",
             first.written.len()
         );
 
-        let second = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
-        assert!(
-            second.is_some(),
-            "an unchanged partition of several files is due again"
-        );
+        let again = storage.list(&dir()).unwrap();
+        compactor(&storage, slicing()).compact(&dir(), &again).unwrap();
 
         assert_eq!(all_keys(&storage), before, "the second pass lost rows");
+    }
+
+    /// §3: once a partition holds nothing but one pass's output, another pass
+    /// would merge the same rows into the same slices. The work is wasted, and
+    /// it repeats for as long as the partition sits above `max_files`.
+    #[test]
+    fn a_partition_holding_only_one_passs_output_is_not_due_again() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
+        let first = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap()
+            .expect("a three-file partition is due");
+        assert!(
+            first.written.len() >= slicing().max_files,
+            "the setup must leave the partition over max_files"
+        );
+
+        let again = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+
+        assert!(again.is_none(), "recompacted a partition with nothing new");
+    }
+
+    /// Compaction settles: it does not rewrite a partition on every pass.
+    #[test]
+    fn compaction_runs_once_for_a_partition_nothing_is_written_to() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
+
+        let passes = (0..4)
+            .filter(|_| {
+                compactor(&storage, slicing())
+                    .compact_if_due(&dir())
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+
+        assert_eq!(passes, 1, "compaction did not settle");
+    }
+
+    /// A flush into a compacted partition makes it due again — that is the whole
+    /// point of the rule being about generations rather than about file count.
+    #[test]
+    fn a_flush_into_a_compacted_partition_makes_it_due_again() {
+        let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
+        compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+
+        write_partition(
+            &storage,
+            &dir(),
+            &batch(&[(4, 40, 3)]),
+            ParquetConfig::default(),
+        )
+        .unwrap();
+
+        let due = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        assert!(due.is_some(), "new rows must be merged in");
+    }
+
+    /// Files of differing generations mean a pass was interrupted, or a flush
+    /// landed mid-merge. Either way there is real work to do.
+    #[test]
+    fn a_partition_of_mixed_generations_is_due() {
+        let storage = InMemoryStorage::new();
+        for (generation, rows) in [(1u32, &[(1u64, 10i64, 0u64)]), (2, &[(2, 20, 1)])] {
+            write_named(
+                &storage,
+                &dir(),
+                &batch(rows),
+                ParquetConfig::default(),
+                Some(Output::new(generation, 0)),
+            )
+            .unwrap();
+        }
+
+        let due = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+
+        assert!(due.is_some(), "a half-merged partition must be finished");
     }
 
     /// §3: an output may never take the name of a file the same pass removes.
@@ -773,10 +883,11 @@ mod tests {
         let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
         compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
 
+        // Directly, for the reason given on the test above.
+        let again = storage.list(&dir()).unwrap();
         let second = compactor(&storage, slicing())
-            .compact_if_due(&dir())
-            .unwrap()
-            .expect("still due");
+            .compact(&dir(), &again)
+            .unwrap();
 
         let clobbered: Vec<_> = second
             .written
