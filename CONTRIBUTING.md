@@ -105,6 +105,24 @@ visible in the diff's behaviour:
 
 The full list, with the reasoning, is in [`CLAUDE.md`](CLAUDE.md).
 
+## Dependencies
+
+Most updates arrive as Dependabot pull requests and are reviewed like any other.
+Two exceptions are worth knowing before you open one yourself:
+
+- **The Arrow stack moves by hand, DataFusion first.** `arrow`, `arrow-flight`,
+  `parquet` and `object_store` must resolve to the Arrow major that `datafusion`
+  resolves, or their types conflict across crate boundaries. Dependabot ignores
+  those four; it watches `datafusion`, because that is the crate whose version
+  decides the others. When its pull request appears, pick the DataFusion version
+  and *derive* the rest from what it depends on — never the reverse — and bump
+  them in one commit. That pull request will not build until you do.
+- **The MSRV is not a dependency.** `dtolnay/rust-toolchain@1.88` in
+  `.github/workflows/ci.yml` is the minimum supported Rust version, not a pinned
+  action to keep current. It changes only together with `rust-version` in
+  `Cargo.toml`, and raising either is a breaking change for anyone pinned to the
+  old toolchain.
+
 ## Commit messages
 
 Commit subjects are prose in the imperative, and the body says *why* — including
