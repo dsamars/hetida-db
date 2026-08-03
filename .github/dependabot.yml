@@ -13,22 +13,30 @@ updates:
       # convention (CONTRIBUTING.md). Dependabot cannot be taught that, so its
       # subjects are left in its own form rather than given a fake prefix.
       prefix: ""
+    ignore:
+      # The Arrow stack is bumped by hand, and this is why.
+      #
+      # arrow, arrow-flight, parquet and object_store must resolve to the Arrow
+      # major that *datafusion* resolves, or their types conflict across crate
+      # boundaries (CLAUDE.md, *Version Alignment*). Grouping them was the first
+      # attempt and is not enough: a group makes them move together when they
+      # all move, but Dependabot bumps each to its own newest, and DataFusion
+      # trailing the current Arrow major is the normal state rather than an
+      # anomaly. So the group produced arrow 59 beside datafusion 54, which
+      # resolves arrow 58 — two Arrow majors, and a build that cannot compile.
+      #
+      # `datafusion` stays watched deliberately. It is the crate that leads, so
+      # its pull request is the signal to derive the other four by hand and bump
+      # them in one commit. That pull request will itself fail to build until
+      # they are — which is the point: it is an alarm, not something to merge.
+      - dependency-name: arrow
+      - dependency-name: arrow-*
+      - dependency-name: parquet
+      - dependency-name: object_store
     groups:
-      # arrow, parquet, arrow-flight and datafusion must resolve to one Arrow
-      # major or their types conflict across crate boundaries (CLAUDE.md,
-      # *Version Alignment*). Bumped one at a time they do not compile, so they
-      # are one pull request — and it is reviewed by picking the DataFusion
-      # version first and deriving the rest, never the other way round.
-      arrow-stack:
-        patterns:
-          - arrow
-          - arrow-*
-          - parquet
-          - datafusion
-          - datafusion-*
-          - object_store
-      # tonic and prost carry Flight's own generated types; the same argument
-      # applies to them as a pair.
+      # tonic and prost carry Flight's own generated types, so they move as a
+      # pair. Unlike the Arrow stack they have no third crate deciding their
+      # version for them, so grouping is sufficient here.
       grpc-stack:
         patterns:
           - tonic
@@ -46,6 +54,15 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # `dtolnay/rust-toolchain@1.88` looks like a pinned action version and is
+      # not one: the ref *is* the minimum supported Rust version, which the
+      # `msrv` job exists to hold still. Keeping it current would turn that job
+      # into a fifth check that the crate builds on the newest toolchain, which
+      # the other four already do — and it would do so silently, since such a
+      # bump goes green. The MSRV is governed by `rust-version` in `Cargo.toml`
+      # and is raised deliberately, never by an update policy.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions:
         patterns:

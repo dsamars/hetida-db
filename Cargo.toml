@@ -64,7 +64,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # The configuration file's format. Same family as Cargo's own, so an operator
 # already knows the syntax.
-toml = "0.9"
+toml = "1.1"
 # Async runtime. Features kept to what the server needs: a multi-threaded
 # runtime, the test/main macros, TCP, and signal handling for shutdown.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
