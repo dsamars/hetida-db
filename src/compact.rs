@@ -789,7 +789,9 @@ mod tests {
         );
 
         let again = storage.list(&dir()).unwrap();
-        compactor(&storage, slicing()).compact(&dir(), &again).unwrap();
+        compactor(&storage, slicing())
+            .compact(&dir(), &again)
+            .unwrap();
 
         assert_eq!(all_keys(&storage), before, "the second pass lost rows");
     }
@@ -809,7 +811,9 @@ mod tests {
             "the setup must leave the partition over max_files"
         );
 
-        let again = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        let again = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap();
 
         assert!(again.is_none(), "recompacted a partition with nothing new");
     }
@@ -836,7 +840,9 @@ mod tests {
     #[test]
     fn a_flush_into_a_compacted_partition_makes_it_due_again() {
         let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
-        compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap();
 
         write_partition(
             &storage,
@@ -846,7 +852,9 @@ mod tests {
         )
         .unwrap();
 
-        let due = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        let due = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap();
         assert!(due.is_some(), "new rows must be merged in");
     }
 
@@ -866,7 +874,9 @@ mod tests {
             .unwrap();
         }
 
-        let due = compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        let due = compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap();
 
         assert!(due.is_some(), "a half-merged partition must be finished");
     }
@@ -881,7 +891,9 @@ mod tests {
     #[test]
     fn an_output_never_takes_the_name_of_an_input_it_replaces() {
         let storage = with_files(&[&[(1, 10, 0)], &[(2, 20, 1)], &[(3, 30, 2)]]);
-        compactor(&storage, slicing()).compact_if_due(&dir()).unwrap();
+        compactor(&storage, slicing())
+            .compact_if_due(&dir())
+            .unwrap();
 
         // Directly, for the reason given on the test above.
         let again = storage.list(&dir()).unwrap();

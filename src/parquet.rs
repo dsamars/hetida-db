@@ -584,7 +584,10 @@ mod tests {
     /// collide with the files it merged.
     #[test]
     fn a_flush_name_is_generation_zero() {
-        assert_eq!(generation_of(Path::new("part-00000000000000000042.parquet")), 0);
+        assert_eq!(
+            generation_of(Path::new("part-00000000000000000042.parquet")),
+            0
+        );
     }
 
     #[test]
