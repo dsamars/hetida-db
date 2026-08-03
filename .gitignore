@@ -1,1 +1,9 @@
 /target
+
+# Python tooling under clients/. Byte cache and test cache are per-machine, and
+# so is the environment; a lockfile beside the project is what pins a run.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
