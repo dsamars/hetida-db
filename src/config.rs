@@ -155,6 +155,74 @@ pub struct FileConfig {
     table_defaults: TableSection,
     /// Per-table overrides (§6).
     tables: BTreeMap<String, TableSection>,
+    /// What the server says about itself, and how (§13).
+    observability: ObservabilitySection,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct ObservabilitySection {
+    level: Option<Level>,
+    format: Option<LogFormat>,
+    filter: Option<Filter>,
+}
+
+/// How much the server says (§13).
+///
+/// Deliberately a closed set rather than a directive: a directive parser reads
+/// an unknown word as a *target* of that name and then logs nothing, which is
+/// indistinguishable from a quiet server. Use [`Observability::filter`] where a
+/// level genuinely will not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
+    /// Only what stopped something.
+    Error,
+    /// Also what failed and will be retried.
+    Warn,
+    /// Also what an operator wants to see happen. The default.
+    Info,
+    /// Also per-call detail.
+    Debug,
+    /// Everything.
+    Trace,
+}
+
+impl Level {
+    /// The directive this level corresponds to.
+    pub fn directive(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+/// How each event is rendered (§13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// For a terminal. The default: the first person to run this reads it.
+    Text,
+    /// One JSON object per event, for a collector that parses.
+    Json,
+}
+
+/// What the server says about itself, and how (§13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observability {
+    /// How much is said.
+    pub level: Level,
+    /// How it is rendered.
+    pub format: LogFormat,
+    /// A full directive, overriding `level` when set.
+    ///
+    /// Validated when the file is read, so a malformed one refuses the start
+    /// rather than surfacing as a silent server.
+    pub filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -401,6 +469,19 @@ impl FileConfig {
         }
     }
 
+    /// What the server says about itself, and how (§13).
+    pub fn observability(&self) -> Observability {
+        Observability {
+            level: self.observability.level.unwrap_or(Level::Info),
+            format: self.observability.format.unwrap_or(LogFormat::Text),
+            filter: self
+                .observability
+                .filter
+                .as_ref()
+                .map(|filter| filter.0.clone()),
+        }
+    }
+
     /// How often each background task looks for work.
     pub fn ticks(&self) -> Ticks {
         let defaults = Ticks::default();
@@ -449,6 +530,24 @@ impl<'de> Deserialize<'de> for Interval {
         PartitionInterval::from_str(&text)
             .map(Interval)
             .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A `tracing` filter directive, validated as it is read (§13).
+///
+/// Checked here rather than at the point of use so a directive that cannot be
+/// parsed refuses the start, in the same breath as an unknown key — a server
+/// that came up saying nothing because of a typo is the failure this avoids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Filter(String);
+
+impl<'de> Deserialize<'de> for Filter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        tracing_subscriber::filter::EnvFilter::builder()
+            .parse(&text)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Filter(text))
     }
 }
 
@@ -1017,5 +1116,84 @@ mod tests {
     fn an_error_names_the_offending_value() {
         let error = FileConfig::parse("[flush]\nmax_age = \"soon\"").expect_err("refuse");
         assert!(error.contains("soon"), "{error}");
+    }
+
+    // ---- observability (§13) ----
+
+    /// §13: the default has to be the human-readable one — the first person to
+    /// run this is reading it themselves.
+    #[test]
+    fn observability_defaults_to_readable_info() {
+        let observability = parsed("").observability();
+
+        assert_eq!(observability.level, Level::Info);
+        assert_eq!(observability.format, LogFormat::Text);
+        assert_eq!(observability.filter, None);
+    }
+
+    #[test]
+    fn every_level_and_format_is_selectable() {
+        for (written, expected) in [
+            ("error", Level::Error),
+            ("warn", Level::Warn),
+            ("info", Level::Info),
+            ("debug", Level::Debug),
+            ("trace", Level::Trace),
+        ] {
+            let text = format!("[observability]\nlevel = \"{written}\"");
+            assert_eq!(parsed(&text).observability().level, expected);
+        }
+
+        assert_eq!(
+            parsed("[observability]\nformat = \"json\"")
+                .observability()
+                .format,
+            LogFormat::Json
+        );
+    }
+
+    /// §13: this is the decision. A directive parser would read `verbose` as a
+    /// *target* of that name and log nothing at all — the silent
+    /// misconfiguration this file rejects unknown keys to avoid.
+    #[test]
+    fn an_unknown_level_is_refused_rather_than_read_as_a_target() {
+        let error = FileConfig::parse("[observability]\nlevel = \"verbose\"").expect_err("refuse");
+        assert!(error.contains("verbose"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_format_is_refused() {
+        let error =
+            FileConfig::parse("[observability]\nformat = \"protobuf\"").expect_err("refuse");
+        assert!(error.contains("protobuf"), "{error}");
+    }
+
+    /// §13: `filter` is the escape hatch for what a level cannot express, and it
+    /// wins over `level` when both are written.
+    #[test]
+    fn a_filter_directive_overrides_the_level() {
+        let observability =
+            parsed("[observability]\nlevel = \"warn\"\nfilter = \"info,hetida_db::wal=debug\"")
+                .observability();
+
+        assert_eq!(
+            observability.filter.as_deref(),
+            Some("info,hetida_db::wal=debug")
+        );
+        // The level stays readable, so an operator can see what was overridden.
+        assert_eq!(observability.level, Level::Warn);
+    }
+
+    /// The escape hatch is lenient about unknown *targets* — one may simply not
+    /// have been reached yet — but not about a directive that is not one.
+    #[test]
+    fn a_malformed_filter_is_refused() {
+        let error = FileConfig::parse("[observability]\nfilter = \"=@=\"").expect_err("refuse");
+        assert!(!error.is_empty(), "the reason must not be empty");
+    }
+
+    #[test]
+    fn unknown_observability_keys_are_refused() {
+        assert!(FileConfig::parse("[observability]\ncolour = true").is_err());
     }
 }

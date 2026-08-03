@@ -35,6 +35,9 @@ async fn main() -> anyhow::Result<()> {
     let retired = retired_in_use(|name| std::env::var(name).ok());
     if !retired.is_empty() {
         for line in &retired {
+            // §13's one exception: the subscriber is configured by the file this
+            // check runs *before* reading, so there is nowhere else for this to
+            // go. Everything past `install` speaks through `tracing`.
             eprintln!("hetida-db: {line}");
         }
         anyhow::bail!(
@@ -47,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
     // One place to configure, so there are no precedence rules.
     let file = FileConfig::resolve(|name| std::env::var(name).ok())
         .context("the configuration could not be used")?;
+
+    // §13: everything after this point speaks through `tracing`. Before it there
+    // is no subscriber, which is why the two failures above still print.
+    let observability = file.observability();
+    hetida_db::observability::install(&observability)
+        .map_err(|error| anyhow::anyhow!("the log subscriber could not be installed: {error}"))?;
 
     let data_dir = file.data_dir().display().to_string();
     let listen = file.listen().to_owned();
@@ -63,29 +72,28 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let recovered = archive.recovered();
-    println!(
-        "hetida-db: opened `{data_dir}` with a {} layout; \
-         recovered {} series, {} schemas, resuming seq at {}",
-        archive.interval(),
-        recovered.registrations,
-        recovered.schemas,
-        recovered.resumed_at,
+    tracing::info!(
+        data_dir = %data_dir,
+        layout = %archive.interval(),
+        series = recovered.registrations,
+        schemas = recovered.schemas,
+        resumed_at = recovered.resumed_at,
+        "archive opened"
     );
     if recovered.truncated {
         // §4: a torn tail never stops a start, but it is never silent either.
-        println!("hetida-db: a log tail was discarded as torn");
+        tracing::warn!("a log tail was discarded as torn");
     }
     if recovered.undecodable > 0 {
-        println!(
-            "hetida-db: {} catalogue record(s) could not be decoded and were skipped",
-            recovered.undecodable
+        tracing::warn!(
+            records = recovered.undecodable,
+            "catalogue records could not be decoded and were skipped"
         );
     }
     if recovered.data_records > 0 {
-        println!(
-            "hetida-db: {} data record(s) are in the log but not yet replayed \
-             into memory — batch replay arrives with do_put",
-            recovered.data_records
+        tracing::info!(
+            records = recovered.data_records,
+            "data records replayed from the log"
         );
     }
 
@@ -122,10 +130,11 @@ async fn main() -> anyhow::Result<()> {
                         // §7: the rows stay, memory grows, and ingestion is
                         // refused before anything is lost. Silence here would
                         // make that chain unexplainable.
-                        eprintln!(
-                            "hetida-db: {} partition(s) of `{table}` failed to flush; \
-                             ingestion will be refused if memory fills",
-                            pass.failed
+                        tracing::warn!(
+                            table = %table,
+                            failed = pass.failed,
+                            "partitions failed to flush; ingestion will be \
+                             refused if memory fills (§7)"
                         );
                     }
                 }
@@ -148,25 +157,30 @@ async fn main() -> anyhow::Result<()> {
                     let dirs = match partition_dirs(storage.as_ref(), &table, archive.interval()) {
                         Ok(dirs) => dirs,
                         Err(error) => {
-                            eprintln!("hetida-db: could not list `{table}` partitions: {error}");
+                            tracing::warn!(
+                                table = %table,
+                                error = %error,
+                                "could not list partitions"
+                            );
                             continue;
                         }
                     };
                     for dir in dirs {
                         match compactor.compact_if_due(&dir) {
-                            Ok(Some(done)) => println!(
-                                "hetida-db: compacted {} into {} file(s), {} rows",
-                                dir.display(),
-                                done.written.len(),
-                                done.rows
+                            Ok(Some(done)) => tracing::info!(
+                                partition = %dir.display(),
+                                files = done.written.len(),
+                                rows = done.rows,
+                                "partition compacted"
                             ),
                             Ok(None) => {}
                             // A failed compaction changes nothing on disk: the
                             // inputs are removed only once the outputs are
                             // durable, so the partition is simply retried.
-                            Err(error) => eprintln!(
-                                "hetida-db: compacting {} failed, will retry: {error}",
-                                dir.display()
+                            Err(error) => tracing::warn!(
+                                partition = %dir.display(),
+                                error = %error,
+                                "compaction failed, will retry"
                             ),
                         }
                     }
@@ -197,32 +211,35 @@ async fn main() -> anyhow::Result<()> {
                     match reaper.reap(&table, Some(retention), now) {
                         Ok(pass) => {
                             for directory in &pass.dropped {
-                                println!(
-                                    "hetida-db: dropped expired partition {}",
-                                    directory.display()
+                                tracing::info!(
+                                    table = %table,
+                                    partition = %directory.display(),
+                                    "expired partition dropped"
                                 );
                             }
                             if pass.failed > 0 {
                                 // Not fatal — the next pass retries — but an
                                 // archive that cannot shed data grows without
                                 // bound, so it is never silent.
-                                eprintln!(
-                                    "hetida-db: {} expired partition(s) of `{table}` \
-                                     could not be dropped; will retry",
-                                    pass.failed
+                                tracing::warn!(
+                                    table = %table,
+                                    failed = pass.failed,
+                                    "expired partitions could not be dropped; \
+                                     will retry"
                                 );
                             }
                             if pass.unrecognised > 0 {
-                                eprintln!(
-                                    "hetida-db: {} directory/ies under `{table}` do not \
-                                     match the {} layout and were left alone",
-                                    pass.unrecognised,
-                                    archive.interval(),
+                                tracing::warn!(
+                                    table = %table,
+                                    directories = pass.unrecognised,
+                                    layout = %archive.interval(),
+                                    "directories do not match the layout and \
+                                     were left alone"
                                 );
                             }
                         }
                         Err(error) => {
-                            eprintln!("hetida-db: could not reap `{table}`: {error}");
+                            tracing::warn!(table = %table, error = %error, "could not reap");
                         }
                     }
                 }
@@ -245,10 +262,7 @@ async fn main() -> anyhow::Result<()> {
         && let Some(path) = std::env::var(CONFIG_VAR).ok().map(PathBuf::from)
         && let Some(mode) = readable_beyond_owner(&path)
     {
-        eprintln!(
-            "hetida-db: {}",
-            Warning::WorldReadableSecrets { path, mode }
-        );
+        tracing::warn!("{}", Warning::WorldReadableSecrets { path, mode });
     }
 
     let mut server = Server::builder();
@@ -257,13 +271,13 @@ async fn main() -> anyhow::Result<()> {
             server = server
                 .tls_config(tls)
                 .context("the TLS identity was refused")?;
-            println!("hetida-db: serving Arrow Flight over TLS on {address}");
+            tracing::info!(%address, tls = true, "serving Arrow Flight");
         }
         None => {
-            println!("hetida-db: serving Arrow Flight on {address}");
-            eprintln!(
-                "hetida-db: no TLS — a bearer token travels in a header, and \
-                 anyone on the path can read and replay it (§9)"
+            tracing::info!(%address, tls = false, "serving Arrow Flight");
+            tracing::warn!(
+                "no TLS — a bearer token travels in a header, and anyone on \
+                 the path can read and replay it (§9)"
             );
         }
     }
@@ -290,9 +304,9 @@ async fn main() -> anyhow::Result<()> {
                 .await
         }
         AuthConfig::Anonymous => {
-            eprintln!(
-                "hetida-db: no authorization — every caller may read and write \
-                 every table (§9)"
+            tracing::warn!(
+                "no authorization — every caller may read and write every \
+                 table (§9)"
             );
             server
                 .add_service(FlightServiceServer::new(HetidaFlightService::new(
@@ -308,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
     flushing.abort();
     compacting.abort();
     reaping.abort();
-    println!("hetida-db: stopped");
+    tracing::info!("stopped");
     Ok(())
 }
 
@@ -319,6 +333,6 @@ async fn main() -> anyhow::Result<()> {
 /// reaches the device before the process exits (§4).
 async fn shutdown() {
     if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("hetida-db: could not listen for shutdown signals: {error}");
+        tracing::error!(%error, "could not listen for shutdown signals");
     }
 }
