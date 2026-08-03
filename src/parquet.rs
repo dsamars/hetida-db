@@ -35,10 +35,19 @@ use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::clock::Micros;
+use crate::instance::FORMAT_VERSION;
 use crate::registry::MetricId;
 use crate::schema::{METRIC_ID_COLUMN, SEQ_COLUMN, TIMESTAMP_COLUMN};
 use crate::seq::Seq;
 use crate::storage::{Storage, StorageError};
+
+/// Footer key carrying the on-disk format version (§12).
+///
+/// Namespaced, because a Parquet footer's key-value metadata is a shared space —
+/// Arrow already writes `ARROW:schema` into it — and an unqualified
+/// `format_version` would be a claim on a name this archive does not own. The
+/// instance metadata uses its own unprefixed key: that file is ours entirely.
+pub const FORMAT_VERSION_KEY: &str = "hetida.format_version";
 
 /// Why a partition could not be written.
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +161,13 @@ pub fn write_named(
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_max_row_group_row_count(Some(config.row_group_rows))
         .set_sorting_columns(Some(sorting_columns(batch)?))
+        // §12: every artefact says which format wrote it. Unread for now — the
+        // instance-level gate covers every file the archive owns — but a stamp
+        // cannot be added to a file after it is on disk.
+        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            FORMAT_VERSION_KEY.to_owned(),
+            FORMAT_VERSION.to_string(),
+        )]))
         .build();
 
     let mut buffer = Vec::new();
@@ -429,6 +445,33 @@ mod tests {
                 "{name} has no statistics, so nothing can prune on it"
             );
         }
+    }
+
+    /// §12: every artefact the archive writes says which format produced it.
+    ///
+    /// Nothing reads this back yet, deliberately — the instance-level gate
+    /// covers every file the archive owns, and a Parquet file carries its own
+    /// schema, so a misinterpretation surfaces as a schema mismatch rather than
+    /// as plausible nonsense. Writing it is what costs nothing now and cannot be
+    /// added retroactively to files already on disk.
+    #[test]
+    fn the_file_is_stamped_with_the_format_version() {
+        let storage = InMemoryStorage::new();
+        let file = write(&storage, &batch(&[(1, 10, 0)])).unwrap();
+
+        let metadata = read_metadata(&storage, &file.path).unwrap();
+        let stamp = metadata
+            .file_metadata()
+            .key_value_metadata()
+            .expect("the footer must carry key-value metadata")
+            .iter()
+            .find(|entry| entry.key == FORMAT_VERSION_KEY)
+            .expect("the format version must be stamped");
+
+        assert_eq!(
+            stamp.value.as_deref(),
+            Some(FORMAT_VERSION.to_string()).as_deref()
+        );
     }
 
     /// The declared sort order is in the footer, so a reader does not have to

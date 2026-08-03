@@ -40,11 +40,22 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::instance::FORMAT_VERSION;
 use crate::seq::Seq;
 use crate::storage::{AppendFile, Storage, StorageError};
 
 /// Bytes of framing ahead of each record's payload: length, CRC, kind, `seq`.
 pub const HEADER_BYTES: usize = 4 + 4 + 1 + 8;
+
+/// Marks a file as a segment of this log (§12).
+///
+/// Separate from the version so that *not one of ours* and *one of ours, from
+/// the future* stay distinguishable: the first is damage to skip, the second is
+/// intact data to refuse over. A single sentinel would conflate them.
+pub const SEGMENT_MAGIC: &[u8; 8] = b"HETIDAWL";
+
+/// Bytes each segment opens with: the magic and the format version.
+pub const SEGMENT_HEADER_BYTES: usize = SEGMENT_MAGIC.len() + 4;
 
 /// What a record carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +131,25 @@ pub enum WalError {
     /// write fails every caller in its group, and errors are not cloneable.
     #[error("write-ahead log write failed: {0}")]
     GroupFailed(String),
+    /// A segment was written by a build with a newer on-disk format (§12).
+    ///
+    /// Deliberately *not* a torn tail: the segment is intact and holds
+    /// acknowledged records. Skipping it would answer from an archive this
+    /// build had only partly read; discarding it would lose durable rows (§1).
+    #[error(
+        "`{}` is on-disk format version {found}, but this build reads at most \
+         {supported}; run a build that understands version {found} rather than \
+         downgrading, which would misread the log",
+        segment.display()
+    )]
+    UnknownFormatVersion {
+        /// The segment carrying the unreadable stamp.
+        segment: PathBuf,
+        /// What the segment is stamped with.
+        found: u32,
+        /// The newest this build can read.
+        supported: u32,
+    },
 }
 
 /// What a replay recovered.
@@ -148,19 +178,53 @@ fn encode(record: &WalRecord) -> Vec<u8> {
     framed
 }
 
+/// The bytes a segment opens with: magic, then the format version (§12).
+fn encode_segment_header() -> Vec<u8> {
+    let mut header = SEGMENT_MAGIC.to_vec();
+    header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header
+}
+
 /// Reads the records of one segment, stopping at the first untrustworthy one.
 ///
-/// Returns the records and whether the segment's tail was discarded.
-fn decode_segment(bytes: &[u8]) -> (Vec<WalRecord>, bool) {
+/// Returns the records and whether the segment's tail was discarded. Fails only
+/// on a version this build cannot read (§12) — every other defect is a tear, and
+/// a tear must never stop a start (§4).
+fn decode_segment(bytes: &[u8], segment: &Path) -> Result<(Vec<WalRecord>, bool), WalError> {
+    // Nothing at all is what opening the log leaves behind before the header
+    // lands. Nothing was lost, so it is not damage.
+    if bytes.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+
+    let Some(header) = bytes.get(..SEGMENT_HEADER_BYTES) else {
+        // A crash between creating the segment and writing its header.
+        return Ok((Vec::new(), true));
+    };
+    let (magic, version_bytes) = header.split_at(SEGMENT_MAGIC.len());
+    if magic != SEGMENT_MAGIC {
+        // Not one of ours. Distinct from a version we cannot read, which is why
+        // the magic is a field of its own.
+        return Ok((Vec::new(), true));
+    }
+    let version = u32::from_le_bytes(version_bytes.try_into().unwrap_or_default());
+    if version > FORMAT_VERSION {
+        return Err(WalError::UnknownFormatVersion {
+            segment: segment.to_path_buf(),
+            found: version,
+            supported: FORMAT_VERSION,
+        });
+    }
+
     let mut records = Vec::new();
-    let mut offset = 0usize;
+    let mut offset = SEGMENT_HEADER_BYTES;
 
     loop {
-        let Some(header) = bytes.get(offset..offset + HEADER_BYTES) else {
+        let Some(framing) = bytes.get(offset..offset + HEADER_BYTES) else {
             // Not even a full header left: a crash landed mid-framing.
-            return (records, offset < bytes.len());
+            return Ok((records, offset < bytes.len()));
         };
-        let (length_bytes, rest) = header.split_at(4);
+        let (length_bytes, rest) = framing.split_at(4);
         let (crc_bytes, kind_and_seq) = rest.split_at(4);
 
         let length = u32::from_le_bytes(length_bytes.try_into().unwrap_or_default()) as usize;
@@ -170,10 +234,10 @@ fn decode_segment(bytes: &[u8]) -> (Vec<WalRecord>, bool) {
         let body_end = body_start + 9 + length;
         let Some(body) = bytes.get(body_start..body_end) else {
             // The length promises more than the segment holds.
-            return (records, true);
+            return Ok((records, true));
         };
         if crc32fast::hash(body) != expected_crc {
-            return (records, true);
+            return Ok((records, true));
         }
 
         let Some(kind) = kind_and_seq
@@ -181,7 +245,7 @@ fn decode_segment(bytes: &[u8]) -> (Vec<WalRecord>, bool) {
             .copied()
             .and_then(RecordKind::from_byte)
         else {
-            return (records, true);
+            return Ok((records, true));
         };
         let seq = kind_and_seq
             .get(1..9)
@@ -203,6 +267,20 @@ fn segment_name(number: u64) -> String {
     format!("{number:012}.wal")
 }
 
+/// Creates the segment at `path` and writes its header (§12).
+///
+/// The header is synced before any record follows it, so a segment on disk
+/// either says what it is or is empty. Without that, a crash could leave a
+/// half-written header in front of records that are themselves intact, and
+/// replay would have to discard them as unreadable. One fsync per segment is
+/// nothing beside the megabytes each one goes on to hold.
+fn start_segment(storage: &dyn Storage, path: &Path) -> Result<Box<dyn AppendFile>, WalError> {
+    let mut file = storage.open_append(path)?;
+    file.append(&encode_segment_header())?;
+    file.sync()?;
+    Ok(file)
+}
+
 /// Reads every segment under `dir` in order, discarding each untrustworthy tail.
 ///
 /// Never fails on damage: a torn tail is the expected state after a crash, and
@@ -221,7 +299,7 @@ pub fn replay(storage: &dyn Storage, dir: &Path) -> Result<Replayed, WalError> {
 
     for segment in storage.list(dir)? {
         let bytes = storage.read(&segment)?;
-        let (records, truncated) = decode_segment(&bytes);
+        let (records, truncated) = decode_segment(&bytes, &segment)?;
         replayed.records.extend(records);
         if truncated {
             replayed.truncated.push(segment);
@@ -261,14 +339,14 @@ impl WalWriter {
         let mut sealed = Vec::with_capacity(existing.len());
         for segment in &existing {
             let bytes = storage.read(segment)?;
-            let (records, _) = decode_segment(&bytes);
+            let (records, _) = decode_segment(&bytes, segment)?;
             let max_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
             sealed.push((segment.clone(), max_seq));
         }
 
         let next_segment = existing.len() as u64;
         let active = dir.join(segment_name(next_segment));
-        let active_file = storage.open_append(&active)?;
+        let active_file = start_segment(storage.as_ref(), &active)?;
 
         Ok(Self {
             storage,
@@ -277,7 +355,7 @@ impl WalWriter {
             sealed,
             active,
             active_file,
-            active_bytes: 0,
+            active_bytes: SEGMENT_HEADER_BYTES as u64,
             active_max_seq: 0,
             next_segment: next_segment + 1,
         })
@@ -315,8 +393,8 @@ impl WalWriter {
         );
         self.sealed.push((sealed, self.active_max_seq));
 
-        self.active_file = self.storage.open_append(&self.active)?;
-        self.active_bytes = 0;
+        self.active_file = start_segment(self.storage.as_ref(), &self.active)?;
+        self.active_bytes = SEGMENT_HEADER_BYTES as u64;
         self.active_max_seq = 0;
         self.next_segment += 1;
         Ok(())
@@ -614,6 +692,134 @@ mod tests {
         writer.write_all(&[record(1, b"truncated header")]).unwrap();
 
         assert_eq!(replay_of(&storage), vec![record(0, b"intact")]);
+    }
+
+    /// Writes `bytes` as segment `number`, bypassing the writer entirely, so a
+    /// test can shape a segment no correct build would produce.
+    fn raw_segment(storage: &InMemoryStorage, number: u64, bytes: &[u8]) {
+        let path = dir().join(segment_name(number));
+        let mut file = storage.open_append(&path).unwrap();
+        file.append(bytes).unwrap();
+        file.sync().unwrap();
+    }
+
+    /// A segment header carrying `version`, followed by nothing.
+    fn header_with(version: u32) -> Vec<u8> {
+        let mut bytes = SEGMENT_MAGIC.to_vec();
+        bytes.extend_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
+    /// §12: a segment is the one artefact with no self-description, so it says
+    /// what it is and which format it is in, once, at its start.
+    #[test]
+    fn a_segment_starts_with_the_magic_and_the_format_version() {
+        let storage = InMemoryStorage::new();
+        let mut writer = writer(&storage);
+        writer.write_all(&[record(0, b"payload")]).unwrap();
+
+        let segment = storage.list(&dir()).unwrap().pop().unwrap();
+        let bytes = storage.read(&segment).unwrap();
+
+        assert_eq!(&bytes[..SEGMENT_MAGIC.len()], SEGMENT_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(
+                bytes[SEGMENT_MAGIC.len()..SEGMENT_HEADER_BYTES]
+                    .try_into()
+                    .unwrap()
+            ),
+            FORMAT_VERSION
+        );
+        // And it still round-trips through the reader that now has to skip it.
+        assert_eq!(replay_of(&storage), vec![record(0, b"payload")]);
+    }
+
+    /// §12: this is the decision. A segment from a newer build is intact data
+    /// this build cannot read — refusing is the only answer that neither
+    /// discards it nor pretends to have read it.
+    #[test]
+    fn a_segment_from_a_newer_build_refuses_to_replay() {
+        let storage = InMemoryStorage::new();
+        let future = FORMAT_VERSION + 1;
+        raw_segment(&storage, 0, &header_with(future));
+
+        let error = replay(&storage, &dir()).expect_err("must refuse");
+
+        assert!(
+            matches!(
+                &error,
+                WalError::UnknownFormatVersion { found, supported, .. }
+                    if *found == future && *supported == FORMAT_VERSION
+            ),
+            "unexpected error: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&future.to_string()) && message.contains("000000000000.wal"),
+            "the message must name the version and the segment: {message}"
+        );
+    }
+
+    /// The refusal outranks reading on. Skipping the unreadable segment would
+    /// answer queries from an archive this build had only partly read, which is
+    /// worse than not starting.
+    #[test]
+    fn a_newer_segment_is_refused_even_behind_readable_ones() {
+        let storage = InMemoryStorage::new();
+        let mut writer = writer(&storage);
+        writer.write_all(&[record(0, b"readable")]).unwrap();
+        drop(writer);
+
+        raw_segment(&storage, 1, &header_with(FORMAT_VERSION + 1));
+
+        assert!(matches!(
+            replay(&storage, &dir()),
+            Err(WalError::UnknownFormatVersion { .. })
+        ));
+    }
+
+    /// §12 + §4: a crash between creating a segment and writing its header
+    /// leaves fewer bytes than the header needs. That is the ordinary tear —
+    /// damage, not a format this build fails to understand.
+    #[test]
+    fn a_torn_segment_header_is_an_ordinary_tear() {
+        let storage = InMemoryStorage::new();
+        raw_segment(&storage, 0, &SEGMENT_MAGIC[..3]);
+
+        let replayed = replay(&storage, &dir()).expect("a tear must never stop a start");
+
+        assert!(replayed.records.is_empty());
+        assert_eq!(replayed.truncated.len(), 1);
+    }
+
+    /// An empty segment is what opening the log leaves behind before anything is
+    /// written to it. Nothing was lost, so it is not damage.
+    #[test]
+    fn an_empty_segment_is_not_damage() {
+        let storage = InMemoryStorage::new();
+        raw_segment(&storage, 0, b"");
+
+        let replayed = replay(&storage, &dir()).unwrap();
+
+        assert!(replayed.records.is_empty());
+        assert!(
+            replayed.truncated.is_empty(),
+            "an empty segment must not be reported as damaged"
+        );
+    }
+
+    /// §12: magic and version are separate fields so that *not one of ours* and
+    /// *one of ours, from the future* stay distinguishable. A foreign file is
+    /// damage, not a version to refuse over.
+    #[test]
+    fn a_file_that_is_not_a_segment_is_treated_as_damage() {
+        let storage = InMemoryStorage::new();
+        raw_segment(&storage, 0, b"not a hetida segment at all");
+
+        let replayed = replay(&storage, &dir()).expect("must not be a format refusal");
+
+        assert!(replayed.records.is_empty());
+        assert_eq!(replayed.truncated.len(), 1);
     }
 
     /// §4: *acked* means *durable*. A crash tears the tail of the active
